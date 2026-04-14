@@ -85,8 +85,8 @@ def animate(t, x, theta, l):
         update,
         frames=len(t),
         init_func=init,
-        interval=30,
-        blit=False   # IMPORTANT for Jupyter
+        interval=30, # 30
+        blit=True   # False
     )
 
     plt.title("Slab + Rigid Rod Animation")
