@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
+import casadi as ca, do_mpc
 
 from src.utils import gauss_process
 
@@ -25,37 +26,37 @@ def wrap_F_caller_as_u_caller(F, m, g):
         return F(t, y) / (m * g)
     return u_caller
 
-def _physical_state_scale(l, g):
+def _physical_state_scale(m, g, l):
     t0 = np.sqrt(l / g)
-    return t0, np.array([l, l / t0, 1.0, 1.0 / t0], dtype=float)
+    return t0, np.array([l, l / t0, 1.0, 1.0 / t0], dtype=float), m * g
 
 def wrap_physical_F_caller_as_u_caller(F, m, g, l):
     """Wraps a physical force callback F(t_phys, y_phys) for normalized dynamics."""
-    t0, state_scale = _physical_state_scale(l, g)
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
 
     def u_caller(t, y):
         y = np.asarray(y, dtype=float).reshape(4)
         y_phys = y * state_scale
         t_phys = float(t) * t0
-        return F(t_phys, y_phys) / (m * g)
+        return F(t_phys, y_phys) / mg
 
     return u_caller
 
 def wrap_u_caller_as_physical_F_caller(u_caller, m, g, l):
     """Wraps a normalized-input controller as a physical force callback."""
-    t0, state_scale = _physical_state_scale(l, g)
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
 
     def F(t, y):
         y = np.asarray(y, dtype=float).reshape(4)
         y_norm = y / state_scale
         t_norm = float(t) / t0
-        return u_caller(t_norm, y_norm) * (m * g)
+        return u_caller(t_norm, y_norm) * mg
 
     return F
 
 def dynamics(t, y, F, M, m, g, l):
     """Compatibility wrapper around the dimensionless dynamics core."""
-    t0, state_scale = _physical_state_scale(l, g)
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     y = np.asarray(y, dtype=float).reshape(4)
     y_norm = y / state_scale
     ydot_norm = dynamics_u(t / t0, y_norm, wrap_physical_F_caller_as_u_caller(F, m, g, l), M / m)
@@ -139,14 +140,14 @@ def simulate_u(u_caller, M, y0=None, t_span=(0, 10), num_points=500):
 
 def simulate(F, M, m, g, l, y0=None, t_span=(0, 10), num_points=500):
     """Simulates the system dynamics given a force policy F(t, y)."""
-    
-    t0 = np.sqrt(l / g)
+
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     t_span = (t_span[0] / t0, t_span[1] / t0)  # Normalize time span
     u_caller = wrap_physical_F_caller_as_u_caller(F, m, g, l)
     if y0 is not None:
-        y0 = np.asarray(y0, dtype=float).reshape(4) / np.array([l, l/t0, 1, 1/t0])  # Normalize initial state
+        y0 = np.asarray(y0, dtype=float).reshape(4) / state_scale  # Normalize initial state
     t, x, x_dot, theta, theta_dot, u = simulate_u(u_caller, M/m, y0=y0, t_span=t_span, num_points=num_points)
-    return t*t0, x*l, x_dot*l/t0, theta, theta_dot*(1/t0), u*m*g
+    return t*t0, x*state_scale[0], x_dot*state_scale[1], theta*state_scale[2], theta_dot*state_scale[3], u*mg
 
 def rk4_step(y, u, dt, M):
     """One RK4 step of the normalized nonlinear dynamics."""
@@ -574,7 +575,7 @@ def solve_nonlinear_mpc(y0, M, Q=None, R=None, Qf=None, horizon=25, dt=0.05,
     else:
         u_opt = result.x
 
-    X_opt = rollout_nonlinear_dynamics(y0, u_opt, dt, M, m)
+    X_opt = rollout_nonlinear_dynamics(y0, u_opt, dt, M)
     return u_opt, X_opt, result
 
 def nonlinear_mpc_u_caller(M, Q=None, R=None, Qf=None, horizon=25, dt=0.05,
@@ -626,20 +627,185 @@ def nonlinear_mpc_F_caller(M, m, g, l, Q=None, R=None, Qf=None, horizon=25, dt=0
                            umax=10.0, y_ref=None, u_ref=0.0, theta_wrap=True,
                            rate_penalty=0.1):
     """Builds a force-based wrapper around the normalized nonlinear MPC controller."""
+    
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_caller = nonlinear_mpc_u_caller(
         M=M/m,
         Q=Q,
         R=R,
         Qf=Qf,
         horizon=horizon,
-        dt=dt,
+        dt=dt/t0,
         umax=umax,
-        y_ref=y_ref,
+        y_ref=y_ref / state_scale,
         u_ref=u_ref,
         theta_wrap=theta_wrap,
         rate_penalty=rate_penalty,
     )
     return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+
+def module_mpc_F_caller(M, m, g, l, Q=None, R=None, model_type='continuous', horizon=20, dt=0.05, umax=10, y_ref=None, u_ref=0.0, rate_penalty=0.1):
+    """Builds a force-based wrapper around the normalized module do-mpc library controller."""
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
+    u_caller = module_mpc_u_caller(
+        M=M/m,
+        Q=Q,
+        R=R,
+        horizon=horizon,
+        dt=dt/t0,
+        umax=umax,
+        y_ref=y_ref / state_scale if y_ref is not None else None,
+        u_ref=u_ref,
+        rate_penalty=rate_penalty,
+    )
+    return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+
+def module_mpc_u_caller(M, Q=None, R=None, model_type='continuous', horizon=20, dt=0.05, umax=10, y_ref=None, u_ref=0.0, rate_penalty=0.1):
+    """ Builds a receding-horizon MPC controller from do-mpc library that operates entirely on normalized input u. """
+
+    # Define Model
+    model = do_mpc.model.Model(model_type)
+
+    # States
+    x = model.set_variable(var_type='_x', var_name='x')
+    x_dot = model.set_variable(var_type='_x', var_name='x_dot')
+    theta = model.set_variable(var_type='_x', var_name='theta')
+    theta_dot = model.set_variable(var_type='_x', var_name='theta_dot')
+
+    # Input
+    u = model.set_variable(var_type='_u', var_name='u')
+
+    # Example nonlinear dynamics TODO
+    delta = 1/3 * (M + 1) - 0.25 * np.cos(theta)**2
+    model.set_rhs('x', x_dot)
+    model.set_rhs('x_dot', (1/3*u + 0.6*ca.sin(theta)*theta_dot**2 - 0.25*ca.sin(theta)*ca.cos(theta)) / delta)
+    model.set_rhs('theta', theta_dot)
+    model.set_rhs('theta_dot', (-0.5*u*ca.cos(theta) - 0.25*ca.sin(theta)*ca.cos(theta)*theta_dot**2 + 0.5*(M+1)*ca.sin(theta)) / delta)
+
+    model.setup()
+
+    # Create MPC Controller
+    mpc = do_mpc.controller.MPC(model)
+
+    setup_mpc = {
+        'n_horizon': horizon,
+        't_step': dt,
+        'state_discretization': 'collocation',
+        'store_full_solution': True,
+        'nlpsol_opts': {
+            'ipopt.print_level': 0,
+            'print_time': 0,
+            'ipopt.sb': 'yes'   # suppress IPOPT banner
+        }
+    }
+
+    mpc.set_param(**setup_mpc)
+
+    # Cost Function
+    x_ref = y_ref if y_ref is not None else np.zeros(4)
+
+    x = model.x['x']
+    x_dot = model.x['x_dot']
+    theta = model.x['theta']
+    theta_dot = model.x['theta_dot']
+    u = model.u['u']
+
+    x_vars = [x, x_dot, theta, theta_dot]
+    u_vars = [u]
+
+    lterm, mterm = quadratic_tracking_cost(x_vars, u_vars, Q, R, x_ref=y_ref, u_ref=u_ref)
+    mpc.set_objective(mterm=mterm, lterm=lterm)
+    mpc.set_rterm(u=rate_penalty)  # penalize input changes
+
+    # Constraints
+    mpc.bounds['lower','_u','u'] = -umax
+    mpc.bounds['upper','_u','u'] = umax
+
+    mpc.setup()
+
+    # Initialize
+    mpc.set_initial_guess()
+
+    return lambda t, y: mpc.make_step(y).flatten()[0]
+
+def quadratic_cost_from_QR(x_vars, u_vars, Q, R):
+    """
+    Build CasADi expressions for MPC cost from Q and R matrices.
+
+    Parameters
+    ----------
+    x_vars : list of CasADi variables (states)
+    u_vars : list of CasADi variables (inputs)
+    Q : numpy array (nx x nx)
+    R : numpy array (nu x nu)
+
+    Returns
+    -------
+    lterm : CasADi expression (stage cost)
+    mterm : CasADi expression (terminal cost)
+    """
+
+    # Stack variables into vectors
+    x = ca.vertcat(*x_vars)
+    u = ca.vertcat(*u_vars)
+
+    # Convert Q, R to CasADi
+    Q_ca = ca.DM(Q)
+    R_ca = ca.DM(R)
+
+    # Quadratic forms
+    x_cost = ca.mtimes([x.T, Q_ca, x])
+    u_cost = ca.mtimes([u.T, R_ca, u])
+
+    lterm = x_cost + u_cost
+    mterm = x_cost  # standard choice
+
+    return lterm, mterm
+
+def quadratic_tracking_cost(x_vars, u_vars, Q, R, x_ref=None, u_ref=None):
+    """
+    Build CasADi expressions for MPC cost from Q and R matrices.
+
+    Parameters
+    ----------
+    x_vars : list of CasADi variables (states)
+    u_vars : list of CasADi variables (inputs)
+    Q : numpy array (nx x nx)
+    R : numpy array (nu x nu)
+    x_ref : numpy array (nx,) or None (reference state)
+    u_ref : numpy array (nu,) or None (reference input)
+
+    Returns
+    -------
+    lterm : CasADi expression (stage cost)
+    mterm : CasADi expression (terminal cost)
+    """
+
+    x = ca.vertcat(*x_vars)
+    u = ca.vertcat(*u_vars)
+
+    Q_ca = ca.DM(Q)
+    R_ca = ca.DM(R)
+
+    if x_ref is not None:
+        x_ref = ca.DM(x_ref)
+        x_err = x - x_ref
+    else:
+        x_err = x
+
+    if u_ref is not None:
+        u_ref = ca.DM(u_ref)
+        u_err = u - u_ref
+    else:
+        u_err = u
+
+    x_cost = ca.mtimes([x_err.T, Q_ca, x_err])
+    u_cost = ca.mtimes([u_err.T, R_ca, u_err])
+
+    lterm = x_cost + u_cost
+    mterm = x_cost
+
+    return lterm, mterm
 
 def lqr_u_caller(A, B, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, model_type="continuous"):
     """Builds a normalized-input LQR controller on the lifted system."""
@@ -687,6 +853,8 @@ def lqr_F_caller(A, B, m, g, l=None, umax=10, y_ref=None, u_ref=0.0, Q_phys=None
         model_type=model_type,
     )
     return wrap_u_caller_as_F_caller(u_caller, m, g) if l is None else wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+
+
 
 # TODO add DeePC control design as well
 
