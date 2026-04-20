@@ -1,7 +1,14 @@
 import numpy as np
+import cvxpy as cp
+
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
 import casadi as ca, do_mpc
+from typing import List
+from cvxpy.expressions.expression import Expression
+from cvxpy.constraints.constraint import Constraint
+from pydeepc import DeePC
+from pydeepc.utils import Data
 
 from src.utils import gauss_process
 
@@ -13,18 +20,6 @@ def sample_F(t, y):
     k_theta = 20
     k_theta_dot = 5
     return -k_theta * y[2] - k_theta_dot * y[3]
-
-def wrap_u_caller_as_F_caller(u_caller, m, g):
-    """Wraps a normalized-input controller so callers can provide/receive force."""
-    def F(t, y):
-        return u_caller(t, y) * (m * g)
-    return F
-
-def wrap_F_caller_as_u_caller(F, m, g):
-    """Wraps a force-based controller so the normalized dynamics can use it."""
-    def u_caller(t, y):
-        return F(t, y) / (m * g)
-    return u_caller
 
 def _physical_state_scale(m, g, l):
     t0 = np.sqrt(l / g)
@@ -211,6 +206,10 @@ def simulate_discrete_lin_sys(A, B, x0, u_caller, num_steps):
 # ----------------------------
 # Linearization
 # ----------------------------
+
+def dummy_lift(y):
+    return y
+
 def lift(y):
     y1, y2, y3, y4 = y
     return np.array([
@@ -378,7 +377,7 @@ def gen_small_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), 
     
     return t_all, X_all, F_all
 
-def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="continuous", lift=lift):
+def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from multiple trajectories."""
     Z_blocks = []
     dZdt_blocks = []
@@ -432,12 +431,12 @@ def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="contin
 
     return A, B
 
-def identify_sys_multiple_trajectories(t_all, X_all, F_all, M, m, g, l, model_type="continuous", lift=lift):
+def identify_sys_multiple_trajectories(t_all, X_all, F_all, M, m, g, l, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from multiple trajectories."""
-    t0 = np.sqrt(l / g)
-    u_all = [F / (m * g) for F in F_all]  # Assuming normalized input
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
+    u_all = [F / mg for F in F_all]  # Assuming normalized input
     t_all = [t / t0 for t in t_all]  # Normalize time
-    X_all = [X / np.array([[l], [l/t0], [1], [1/t0]]) for X in X_all]  # Normalize states
+    X_all = [X / state_scale for X in X_all]  # Normalize states
     return identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type=model_type, lift=lift)
 
 # ----------------------------
@@ -508,15 +507,16 @@ def lqr_4state_u_caller(M, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
 
 def lqr_4state_F_caller(M, m, g, l=None, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
     """Builds a force-based wrapper around the normalized 4-state LQR controller."""
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_caller, K, A, B = lqr_4state_u_caller(
         M=M/m,
         Q=Q,
         R=R,
         umax=umax,
-        y_ref=y_ref,
+        y_ref=y_ref/state_scale if y_ref is not None else None,
         u_ref=u_ref,
     )
-    F_caller = wrap_u_caller_as_F_caller(u_caller, m, g) if l is None else wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+    F_caller = wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
     return F_caller, K, A, B
 
 def solve_nonlinear_mpc(y0, M, Q=None, R=None, Qf=None, horizon=25, dt=0.05,
@@ -840,8 +840,9 @@ def lqr_u_caller(A, B, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, mode
 
     return u_caller
 
-def lqr_F_caller(A, B, m, g, l=None, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, model_type="continuous"):
+def lqr_F_caller(A, B, m, g, l, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, model_type="continuous"):
     """Builds a force-based wrapper around the normalized lifted-system LQR controller."""
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_caller = lqr_u_caller(
         A=A,
         B=B,
@@ -852,9 +853,108 @@ def lqr_F_caller(A, B, m, g, l=None, umax=10, y_ref=None, u_ref=0.0, Q_phys=None
         R=R,
         model_type=model_type,
     )
-    return wrap_u_caller_as_F_caller(u_caller, m, g) if l is None else wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+    return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l) 
+
+def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=50, umax=10.0, lambda_g=1e-3, lambda_y=1e-3, lift=dummy_lift):
+    """Builds a data-driven MPC controller from trajectories"""
+    Z_blocks = []
+    
+    for X, u, t in zip(X_all, u_all, t_all):
+        Zt = np.array([lift(X[:, i]) for i in range(X.shape[1])]).T
+        Z_blocks.append(Zt)
+
+    Zt = np.hstack(Z_blocks).T
+    Ut = np.hstack(u_all).T.reshape(-1, 1)
+
+    n_y = Zt.shape[1]
+    n_u = Ut.shape[1]
+
+    # -----------------------------
+    # Default weights
+    # -----------------------------
+    if Q is None:
+        Q = np.eye(n_y)
+    if R is None:
+        R = np.eye(n_u)
+
+    Q = np.array(Q)
+    R = np.array(R)
+    y_tar = lift(x_tar)
 
 
+    # DeePC Definitions
+    def loss_callback(u: cp.Variable, y: cp.Variable) -> Expression:
+        cost = 0
 
-# TODO add DeePC control design as well
+        for k in range(horizon):
+            y_k = y[k, :]
+            u_k = u[k, :]
+
+            cost += cp.quad_form(y_k - y_tar, Q)
+            cost += cp.quad_form(u_k, R)
+
+        return cost
+    
+    def constraints_callback(u: cp.Variable, y: cp.Variable) -> List[Constraint]:
+        horizon, M, P = u.shape[0], u.shape[1], y.shape[1]
+        # Define a list of input/output constraints
+        return [u >= -umax, u <= umax]
+
+    data = Data(Ut, Zt)
+    deepc = DeePC(data, memory, horizon)
+
+    # Build the deepc problem
+    deepc.build_problem(
+        build_loss = loss_callback,
+        build_constraints = constraints_callback,
+        lambda_g = lambda_g,
+        lambda_y = lambda_y)
+    
+    # Controller
+    # store past window
+    u_hist = []
+    y_hist = []
+
+    def u_caller(t, y_current):
+        nonlocal u_hist, y_hist
+
+        z = lift(y_current)
+
+        # update history
+        y_hist.append(z)
+        if len(y_hist) > memory:
+            y_hist.pop(0)
+
+        if len(u_hist) < memory:
+            u_hist.append(np.zeros(n_u))
+        elif len(u_hist) > memory:
+            u_hist.pop(0)
+
+        # need full memory before solving
+        if len(y_hist) < memory:
+            return np.zeros(n_u).flatten()[0]
+
+        # build DeePC initial condition
+        y_ini = np.array(y_hist)   # shape (memory, n_y)
+        u_ini = np.array(u_hist)   # shape (memory, n_u)
+
+        data_ini = Data(u_ini, y_ini)
+        # print(data_ini)
+
+        # solve DeePC
+        u_opt = deepc.solve(data_ini)[0]
+        # print(u_opt.shape)
+
+        u_next = u_opt[0, :]
+
+        # update input history
+        u_hist.append(u_next)
+        if len(u_hist) > memory:
+            u_hist.pop(0)
+
+        return np.clip(u_next, -umax, umax).flatten()[0]
+
+    return u_caller
+
+
 
