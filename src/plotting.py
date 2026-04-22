@@ -80,12 +80,13 @@ def animate(t, x, theta, l):
 
         return slab, rod
 
+    interval = (t[-1] - t[0]) / len(t) * 1000  # Convert to milliseconds
     ani = FuncAnimation(
         fig,
         update,
         frames=len(t),
         init_func=init,
-        interval=30, # 30
+        interval=interval, # 30
         blit=True   # False
     )
 

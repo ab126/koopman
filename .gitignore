@@ -1,6 +1,6 @@
 venv/
 .idea/
 .ipynb_checkpoints/
-src/__pycache__/
-deepc/
+__pycache__/
+/deepc/
 

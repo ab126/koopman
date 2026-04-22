@@ -7,6 +7,7 @@ import casadi as ca, do_mpc
 from typing import List
 from cvxpy.expressions.expression import Expression
 from cvxpy.constraints.constraint import Constraint
+from tqdm import tqdm
 from pydeepc import DeePC
 from pydeepc.utils import Data
 
@@ -104,7 +105,7 @@ def _sample_piecewise_constant_control(call_log, t_eval):
     indices = np.clip(indices, 0, len(values) - 1)
     return values[indices]
 
-def simulate_u(u_caller, M, y0=None, t_span=(0, 10), num_points=500):
+def simulate_u(u_caller, M, y0=None, t_span=(0, 10), num_points=500, verbose=False):
     """Simulates the normalized dynamics given a normalized control policy u(t, y)."""
     t_eval = np.linspace(*t_span, num_points)
 
@@ -120,6 +121,8 @@ def simulate_u(u_caller, M, y0=None, t_span=(0, 10), num_points=500):
         return u
 
     dyn_caller = lambda t, y: dynamics_u(t, y, u_caller=logged_u_caller, M=M)
+    if verbose:
+        print("Running ODE integration...")
     sol = solve_ivp(dyn_caller, t_span, y0, t_eval=t_eval)
 
     # Extract
@@ -133,7 +136,68 @@ def simulate_u(u_caller, M, y0=None, t_span=(0, 10), num_points=500):
 
     return t, x, x_dot, theta, theta_dot, u
 
-def simulate(F, M, m, g, l, y0=None, t_span=(0, 10), num_points=500):
+def simulate_u_rk4(u_caller, M, y0=None, t_span=(0, 10), num_points=500, verbose=False):
+    """
+    Simulates the normalized system using fixed-step RK4.
+    
+    Parameters
+    ----------
+    u_caller : callable
+        Normalized input caller u(t, y)
+    M : system parameter
+    y0 : initial state [x, xdot, theta, thetadot]
+    t_span : (t0, tf)
+    dt : timestep
+
+    Returns
+    -------
+    t, x, x_dot, theta, theta_dot, u
+    """
+
+    if y0 is None:
+        y0 = np.array([0.0, 0.0, 0.03, 0.0], dtype=float)
+    else:
+        y0 = np.asarray(y0, dtype=float).reshape(4)
+
+    t0, tf = t_span
+    dt = (float(tf) - float(t0)) / num_points  # Adjust dt to fit exactly into t_span
+
+    t_vals = np.zeros(num_points + 1)
+    X = np.zeros((4, num_points + 1))
+    U = np.zeros(num_points)
+
+    X[:, 0] = y0
+    t_vals[0] = t0
+
+    def f(t, y):
+        return dynamics_open_loop(y, u_caller(t, y), M)
+
+    y = y0.copy()
+    t = t0
+
+    loop_iter = tqdm(range(num_points), desc="RK4 Integration") if verbose else range(num_points)
+    for k in loop_iter:
+        # control evaluated ONCE per step
+        u = u_caller(t, y)
+        U[k] = u
+
+        k1 = f(t, y)
+        k2 = f(t + dt/2, y + dt/2 * k1)
+        k3 = f(t + dt/2, y + dt/2 * k2)
+        k4 = f(t + dt, y + dt * k3)
+
+        y = y + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        t = t + dt
+
+        X[:, k+1] = y
+        t_vals[k+1] = t
+
+    X = X[:, 1:] # Drop initial state to match dimensions with U
+    t_vals = t_vals[1:]
+
+    return t_vals, X[0], X[1], X[2], X[3], U
+
+def simulate(F, M, m, g, l, y0=None, t_span=(0, 10), num_points=500, method='ivp', verbose=False):
     """Simulates the system dynamics given a force policy F(t, y)."""
 
     t0, state_scale, mg = _physical_state_scale(m, g, l)
@@ -141,7 +205,13 @@ def simulate(F, M, m, g, l, y0=None, t_span=(0, 10), num_points=500):
     u_caller = wrap_physical_F_caller_as_u_caller(F, m, g, l)
     if y0 is not None:
         y0 = np.asarray(y0, dtype=float).reshape(4) / state_scale  # Normalize initial state
-    t, x, x_dot, theta, theta_dot, u = simulate_u(u_caller, M/m, y0=y0, t_span=t_span, num_points=num_points)
+    if method == 'ivp':
+        t, x, x_dot, theta, theta_dot, u = simulate_u(u_caller, M/m, y0=y0, t_span=t_span, num_points=num_points, verbose=verbose)
+    elif method == 'rk4':
+        t, x, x_dot, theta, theta_dot, u = simulate_u_rk4(u_caller, M/m, y0=y0, t_span=t_span, num_points=num_points, verbose=verbose)
+    else:
+        raise ValueError("method must be either 'ivp' or 'rk4'.")
+    
     return t*t0, x*state_scale[0], x_dot*state_scale[1], theta*state_scale[2], theta_dot*state_scale[3], u*mg
 
 def rk4_step(y, u, dt, M):
@@ -206,6 +276,26 @@ def simulate_discrete_lin_sys(A, B, x0, u_caller, num_steps):
 # ----------------------------
 # Linearization
 # ----------------------------
+
+def linearize_upright_dynamics(M):
+    """Returns the continuous-time 4-state linearization about [x, xdot, theta, thetadot] = 0."""
+    alpha = M + 1.0
+    det = alpha / 3.0 - 0.25
+
+    A = np.array([
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, -0.25 / det, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.5 * alpha / det, 0.0],
+    ])
+    B = np.array([
+        [0.0],
+        [1.0 / (3.0 * det)],
+        [0.0],
+        [-0.5 / det],
+    ])
+
+    return A, B
 
 def dummy_lift(y):
     return y
@@ -339,9 +429,10 @@ def identify_sys(x, x_dot, theta, theta_dot, F, M, m, g, l, t=None, model_type="
     u = F / (m * g)  # Assuming normalized input
     return identify_sys_u(x/l, x_dot/(l/t0), theta, theta_dot/(1/t0), u, t=t/t0, model_type=model_type)
 
-def gen_small_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10):
-    """Generates state/input trajectories for small theta."""
+def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True):
+    """Generates state/input trajectories up to a maximum theta."""
 
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
     t_lin = np.linspace(*t_span, num_points)
     t_all = []
     X_all = []
@@ -351,15 +442,16 @@ def gen_small_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), 
         idx = np.where(arr > value)[0]
         return idx[0] if len(idx) > 0 else -1
 
-    for _ in range(n_repeats):
-        all_F = gauss_process(t_lin, sigma=sigma*m*g)
+    loop_iter = tqdm(range(n_repeats), desc="Trajectory Generation") if verbose else range(n_repeats)
+    for _ in loop_iter:
+        all_F = gauss_process(t_lin, sigma=sigma*mg)
 
         def gauss_F(t_val, y):
             def closest_index(arr, val):
                 return min(range(len(arr)), key=lambda i: abs(arr[i] - val))    
             return all_F[closest_index(t_lin, t_val)]
         
-        x0 = [0.0, 0.0, np.random.uniform(-theta_max/2, theta_max/2), 0.0]
+        x0 = [0.0, 0.0, np.random.uniform(-theta_max*0.6, theta_max*0.6), 0.0]
 
         t, x, x_dot, theta, theta_dot, F = simulate(gauss_F, M, m, g, l, y0=x0, t_span=t_span, num_points=num_points)
         ind = first_greater(np.abs(theta), theta_max)
@@ -389,7 +481,10 @@ def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="contin
         Z = np.array([lift(X[:, i]) for i in range(X.shape[1])]).T
 
         if model_type == "continuous":
-            dZdt_blocks.append(finite_difference(Z, t))
+            try:
+                dZdt_blocks.append(finite_difference(Z, t))
+            except ValueError as e:
+                continue  # Skip this trajectory if it doesn't have the right number of samples
             Z_blocks.append(Z)
             Uk_blocks.append(np.asarray(u, dtype=float).reshape(1, -1))
         elif model_type == "discrete":
@@ -436,7 +531,7 @@ def identify_sys_multiple_trajectories(t_all, X_all, F_all, M, m, g, l, model_ty
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_all = [F / mg for F in F_all]  # Assuming normalized input
     t_all = [t / t0 for t in t_all]  # Normalize time
-    X_all = [X / state_scale for X in X_all]  # Normalize states
+    X_all = [X / state_scale.reshape(4, 1) for X in X_all]  # Normalize states
     return identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type=model_type, lift=lift)
 
 # ----------------------------
@@ -462,26 +557,6 @@ def lqr_ct(A, B, Q, R):
     K = np.linalg.solve(R, B.T @ P)
 
     return K
-
-def linearize_upright_dynamics(M):
-    """Returns the continuous-time 4-state linearization about [x, xdot, theta, thetadot] = 0."""
-    alpha = M + 1.0
-    det = alpha / 3.0 - 0.25
-
-    A = np.array([
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, -0.25 / det, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.5 * alpha / det, 0.0],
-    ])
-    B = np.array([
-        [0.0],
-        [1.0 / (3.0 * det)],
-        [0.0],
-        [-0.5 / det],
-    ])
-
-    return A, B
 
 def lqr_4state_u_caller(M, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
     """Builds a normalized-input LQR controller on the original 4-state linearization."""
@@ -855,7 +930,8 @@ def lqr_F_caller(A, B, m, g, l, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=N
     )
     return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l) 
 
-def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=50, umax=10.0, lambda_g=1e-3, lambda_y=1e-3, lift=dummy_lift):
+def deepc_caller(t_all, X_all, u_all, x_tar, dt=0.02, Q=None, R=None, horizon=25, memory=50, umax=1000.0, lambda_g=1e-3, lambda_y=1e-3, lift=dummy_lift,
+                 y_max=1000.0, f_horizon=1, verbose=False):
     """Builds a data-driven MPC controller from trajectories"""
     Z_blocks = []
     
@@ -865,6 +941,8 @@ def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=
 
     Zt = np.hstack(Z_blocks).T
     Ut = np.hstack(u_all).T.reshape(-1, 1)
+    if verbose:
+        print("rank Zt:", np.linalg.matrix_rank(Zt))
 
     n_y = Zt.shape[1]
     n_u = Ut.shape[1]
@@ -898,7 +976,7 @@ def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=
     def constraints_callback(u: cp.Variable, y: cp.Variable) -> List[Constraint]:
         horizon, M, P = u.shape[0], u.shape[1], y.shape[1]
         # Define a list of input/output constraints
-        return [u >= -umax, u <= umax]
+        return [u >= -umax * np.ones((horizon, n_u)), u <= umax * np.ones((horizon, n_u)), cp.norm_inf(y) <= y_max]
 
     data = Data(Ut, Zt)
     deepc = DeePC(data, memory, horizon)
@@ -912,11 +990,18 @@ def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=
     
     # Controller
     # store past window
-    u_hist = []
-    y_hist = []
+    controller_state = {
+        "next_update_t": None,
+        "current_u": 0.0,
+        "u_seq": None,  # Full horizon sequence
+        "seq_index": 0,  # Current index in the sequence
+    }
+    u_hist = [np.zeros(n_u) for _ in range(memory)]  # start with zero input history (can warm-start with real data if desired)
+    y_hist = [np.zeros(n_y) for _ in range(memory)]  # start with zero output history (can be warm-started with real data if desired)
 
     def u_caller(t, y_current):
         nonlocal u_hist, y_hist
+        # print(u_hist)
 
         z = lift(y_current)
 
@@ -925,36 +1010,57 @@ def deepc_caller(t_all, X_all, u_all, x_tar, Q=None, R=None, horizon=25, memory=
         if len(y_hist) > memory:
             y_hist.pop(0)
 
-        if len(u_hist) < memory:
-            u_hist.append(np.zeros(n_u))
-        elif len(u_hist) > memory:
-            u_hist.pop(0)
+        if controller_state["next_update_t"] is None or t >= controller_state["next_update_t"]:
+        
+            if len(y_hist) < memory:
+                return 0.0
 
-        # need full memory before solving
-        if len(y_hist) < memory:
-            return np.zeros(n_u).flatten()[0]
+            y_ini = np.array(y_hist)
+            u_ini = np.array(u_hist)
+            if verbose:
+                print(f"||y_ini||: {np.linalg.norm(y_ini)}, ||u_ini||: {np.linalg.norm(u_ini)}")
 
-        # build DeePC initial condition
-        y_ini = np.array(y_hist)   # shape (memory, n_y)
-        u_ini = np.array(u_hist)   # shape (memory, n_u)
+            data_ini = Data(u_ini, y_ini)
 
-        data_ini = Data(u_ini, y_ini)
-        # print(data_ini)
+            # Solve
+            try:
+                u_opt = deepc.solve(data_ini, solver=cp.OSQP, 
+                    warm_start=True, 
+                    verbose=False)[0]
+            except Exception as e:
+                if verbose:
+                    print(f"DeePC OSQP solver failed with error: {e}\nSwitching to default solver")
+                u_opt = deepc.solve(data_ini)[0]
+            
+            # Store the full horizon sequence
+            controller_state["u_seq"] = u_opt[:f_horizon, :] if f_horizon < horizon else u_opt
+            controller_state["seq_index"] = 0
+            controller_state["next_update_t"] = t + f_horizon * dt
+            
+            u_next = u_opt[0, :]
+            
+            # update histories
+            u_hist.append(u_next)
+            if len(u_hist) > memory:
+                u_hist.pop(0)
 
-        # solve DeePC
-        u_opt = deepc.solve(data_ini)[0]
-        # print(u_opt.shape)
-
-        u_next = u_opt[0, :]
-
-        # update input history
-        u_hist.append(u_next)
-        if len(u_hist) > memory:
-            u_hist.pop(0)
-
-        return np.clip(u_next, -umax, umax).flatten()[0]
-
+            controller_state["current_u"] = float(u_next.flatten()[0])
+        else:
+            # Use next input from the locked-in sequence
+            controller_state["seq_index"] += 1
+            if controller_state["u_seq"] is not None and controller_state["seq_index"] < len(controller_state["u_seq"]):
+                u_next = controller_state["u_seq"][controller_state["seq_index"], :]
+                
+                # update histories with the locked-in input
+                u_hist.append(u_next)
+                if len(u_hist) > memory:
+                    u_hist.pop(0)
+                
+                controller_state["current_u"] = float(u_next.flatten()[0])
+        
+        return controller_state["current_u"]
+    
     return u_caller
 
-
+# TODO: input should start right away
 
