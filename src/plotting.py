@@ -95,9 +95,134 @@ def animate(t, x, theta, l):
     # prevent garbage collection
     global anim_ref
     anim_ref = ani
-
-    plt.show()
-
+    plt.close(fig)
     return ani
 
+def animate_point_mass(t, x, theta, l, F, case_name='', frame_step = 2, interval=None):
+    """ Animates the point mass inverted pendulum system """
+
+    frame_indices = np.arange(0, len(t), frame_step)
+
+    cart_width = 0.4
+    cart_height = 0.2
+    wheel_radius = 0.05
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    # Keep vertical limits fixed, since the pendulum length does not change
+    ax.set_ylim(-0.3, 1.4)
+    ax.set_aspect('equal')
+    ax.set_title(f"Inverted Pendulum {case_name}")
+    ax.set_xlabel("Horizontal position")
+    ax.set_ylabel("Vertical position")
+    ax.grid(True)
+
+    # Ground line will also be updated each frame so it spans the current camera window
+    ground_y = -0.1
+    ground_line, = ax.plot([], [], linewidth=2)
+
+    # Artists we will update frame-by-frame
+    cart_body, = ax.plot([], [], linewidth=3)
+    left_wheel, = ax.plot([], [], marker='o', markersize=8)
+    right_wheel, = ax.plot([], [], marker='o', markersize=8)
+    rod_line, = ax.plot([], [], linewidth=3)
+    bob_point, = ax.plot([], [], marker='o', markersize=10)
+    info_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, va='top')
+
+    def init():
+        ground_line.set_data([], [])
+        cart_body.set_data([], [])
+        left_wheel.set_data([], [])
+        right_wheel.set_data([], [])
+        rod_line.set_data([], [])
+        bob_point.set_data([], [])
+        info_text.set_text("")
+        return ground_line, cart_body, left_wheel, right_wheel, rod_line, bob_point, info_text
+
+    def update(frame_idx):
+        i = frame_indices[frame_idx]
+
+        xi = x[i]
+        thetai = theta[i]   # raw angle for geometry
+
+        # -----------------------------
+        # Moving camera window
+        # -----------------------------
+        view_half_width = 2.0
+        ax.set_xlim(xi - view_half_width, xi + view_half_width)
+
+        # Update the ground line so it fills the current view
+        ground_line.set_data(
+            [xi - view_half_width, xi + view_half_width],
+            [ground_y, ground_y]
+        )
+
+        # -----------------------------
+        # Cart body
+        # -----------------------------
+        cart_left = xi - cart_width / 2
+        cart_right = xi + cart_width / 2
+        cart_bottom = 0.0
+        cart_top = cart_height
+
+        cart_xs = [cart_left, cart_right, cart_right, cart_left, cart_left]
+        cart_ys = [cart_bottom, cart_bottom, cart_top, cart_top, cart_bottom]
+        cart_body.set_data(cart_xs, cart_ys)
+
+        # -----------------------------
+        # Wheels
+        # -----------------------------
+        left_wheel.set_data([xi - cart_width / 4], [ground_y + wheel_radius])
+        right_wheel.set_data([xi + cart_width / 4], [ground_y + wheel_radius])
+
+        # -----------------------------
+        # Pendulum geometry
+        # -----------------------------
+        pivot_x = xi
+        pivot_y = cart_top
+
+        # theta = 0 upright, clockwise positive
+        bob_x = pivot_x + l * np.sin(thetai)
+        bob_y = pivot_y + l * np.cos(thetai)
+
+        rod_line.set_data([pivot_x, bob_x], [pivot_y, bob_y])
+        bob_point.set_data([bob_x], [bob_y])
+
+        # -----------------------------
+        # On-figure text
+        # -----------------------------
+        info_text.set_text(
+            f"t = {t[i]:.2f} s\n"
+            f"x = {x[i]:.2f} m\n"
+            f"theta = {theta[i]/np.pi * 180:.2f} deg\n"
+            f"F = {F[i]:.2f} N"
+        )
+
+        return ground_line, cart_body, left_wheel, right_wheel, rod_line, bob_point, info_text
+    
+    if interval is None:
+        interval = (t[-1] - t[0]) / len(t) * 1000  # Convert to milliseconds
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(frame_indices),
+        init_func=init,
+        interval=interval * frame_step,
+        blit=True
+    )
+    plt.close(fig)
+    return anim
+
+def save_animation(anim, filename):
+    """Saves the animation to a file."""
+    anim.save(filename, writer='ffmpeg', fps=30)
+
+# For concatenating generated trajectories
+def concat_first_axis(arr_list):
+    arr_2d = [
+        a if a.ndim == 1 else a.T
+        for a in arr_list
+    ]
+    return np.concatenate(arr_2d, axis=0)
 

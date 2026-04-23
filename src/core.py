@@ -580,7 +580,7 @@ def lqr_4state_u_caller(M, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
 
     return u_caller, K, A, B
 
-def lqr_4state_F_caller(M, m, g, l=None, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
+def lqr_4state_F_caller(M, m, g, l, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
     """Builds a force-based wrapper around the normalized 4-state LQR controller."""
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_caller, K, A, B = lqr_4state_u_caller(
