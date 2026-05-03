@@ -317,7 +317,8 @@ def inv_lift(z):
     # Inverse of the lift function (only returns original state variables)
     return z[:4]
 
-def build_dataset(X, u):
+def build_dataset(X, u, lift=dummy_lift):
+    """ Builds lifted datasets for discrete-time Koopman identification from state/input trajectories. """
     Z = np.array([lift(X[:, i]) for i in range(X.shape[1])]).T
 
     Zk = Z[:, :-1]
@@ -393,7 +394,7 @@ def is_persistently_exciting(u, L):
     rank = np.linalg.matrix_rank(H)
     return rank, (rank == L)
 
-def identify_sys_u(x, x_dot, theta, theta_dot, u, t=None, model_type="continuous"):
+def identify_sys_u(x, x_dot, theta, theta_dot, u, t=None, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from state/input trajectories.
 
     model_type="continuous" fits dz/dt = A z + B u.
@@ -407,7 +408,7 @@ def identify_sys_u(x, x_dot, theta, theta_dot, u, t=None, model_type="continuous
             raise ValueError("Time vector t is required for continuous-time identification.")
         A, B = koopman_identification_ct(Z, u, t)
     elif model_type == "discrete":
-        Zk, Zkp1, Uk = build_dataset(X, u)
+        Zk, Zkp1, Uk = build_dataset(X, u, lift=lift)
         A, B = koopman_identification(Zk, Zkp1, Uk)
     else:
         raise ValueError("model_type must be either 'continuous' or 'discrete'.")
@@ -423,14 +424,18 @@ def identify_sys_u(x, x_dot, theta, theta_dot, u, t=None, model_type="continuous
 
     return A, B
 
-def identify_sys(x, x_dot, theta, theta_dot, F, M, m, g, l, t=None, model_type="continuous"):
+def identify_sys(x, x_dot, theta, theta_dot, F, m=1, g=1, l=1, t=None, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from state/force trajectories."""
-    t0 = np.sqrt(l / g)
-    u = F / (m * g)  # Assuming normalized input
-    return identify_sys_u(x/l, x_dot/(l/t0), theta, theta_dot/(1/t0), u, t=t/t0, model_type=model_type)
+    t0, state_scale, mg = _physical_state_scale(m, g, l)
+    x = x / state_scale[0]
+    x_dot = x_dot / state_scale[1]
+    theta = theta / state_scale[2]
+    theta_dot = theta_dot / state_scale[3]
+    u = F / (mg)  # Assuming normalized input
+    return identify_sys_u(x, x_dot, theta, theta_dot, u, t=t/t0, model_type=model_type, lift=lift)
 
-def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True):
-    """Generates state/input trajectories up to a maximum theta."""
+def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True, method='ivp'):
+    """Generates state/input trajectories up to a maximum theta and then repeats."""
 
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     t_lin = np.linspace(*t_span, num_points)
@@ -453,7 +458,7 @@ def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), nu
         
         x0 = [0.0, 0.0, np.random.uniform(-theta_max*0.6, theta_max*0.6), 0.0]
 
-        t, x, x_dot, theta, theta_dot, F = simulate(gauss_F, M, m, g, l, y0=x0, t_span=t_span, num_points=num_points)
+        t, x, x_dot, theta, theta_dot, F = simulate(gauss_F, M, m, g, l, y0=x0, t_span=t_span, num_points=num_points, method=method, verbose=False)
         ind = first_greater(np.abs(theta), theta_max)
         if ind > 0:
             t = t[:ind]
@@ -521,12 +526,12 @@ def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="contin
 
     # PE check
     L = 20
-    rank_PE, pe_flag = is_persistently_exciting(np.hstack(Uk_blocks).ravel(), L)
+    rank_PE, pe_flag = is_persistently_exciting(np.hstack(Uk_blocks).ravel(), L) # TODO: Check L
     print("PE rank:", rank_PE, "Full:", pe_flag)
 
     return A, B
 
-def identify_sys_multiple_trajectories(t_all, X_all, F_all, M, m, g, l, model_type="continuous", lift=dummy_lift):
+def identify_sys_multiple_trajectories(t_all, X_all, F_all, m=1, g=1, l=1, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from multiple trajectories."""
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_all = [F / mg for F in F_all]  # Assuming normalized input
