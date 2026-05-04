@@ -456,7 +456,7 @@ def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), nu
                 return min(range(len(arr)), key=lambda i: abs(arr[i] - val))    
             return all_F[closest_index(t_lin, t_val)]
         
-        x0 = [0.0, 0.0, np.random.uniform(-theta_max*0.6, theta_max*0.6), 0.0]
+        x0 = [0.0, np.random.uniform(-state_scale[1], state_scale[1]), np.random.uniform(-theta_max*0.6, theta_max*0.6), np.random.uniform(-theta_max, theta_max)/t0]
 
         t, x, x_dot, theta, theta_dot, F = simulate(gauss_F, M, m, g, l, y0=x0, t_span=t_span, num_points=num_points, method=method, verbose=False)
         ind = first_greater(np.abs(theta), theta_max)
