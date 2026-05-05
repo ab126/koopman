@@ -1,13 +1,16 @@
 import numpy as np
 import cvxpy as cp
+import casadi as ca
+import do_mpc
+from tqdm import tqdm
 
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
-import casadi as ca, do_mpc
+from scipy.linalg import solve_continuous_are
+
 from typing import List
 from cvxpy.expressions.expression import Expression
 from cvxpy.constraints.constraint import Constraint
-from tqdm import tqdm
 from pydeepc import DeePC
 from pydeepc.utils import Data
 
@@ -424,7 +427,7 @@ def identify_sys_u(x, x_dot, theta, theta_dot, u, t=None, model_type="continuous
 
     return A, B
 
-def identify_sys(x, x_dot, theta, theta_dot, F, m=1, g=1, l=1, t=None, model_type="continuous", lift=dummy_lift):
+def identify_sys(x, x_dot, theta, theta_dot, F, m=1., g=1., l=1., t=None, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from state/force trajectories."""
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     x = x / state_scale[0]
@@ -531,7 +534,7 @@ def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="contin
 
     return A, B
 
-def identify_sys_multiple_trajectories(t_all, X_all, F_all, m=1, g=1, l=1, model_type="continuous", lift=dummy_lift):
+def identify_sys_multiple_trajectories(t_all, X_all, F_all, m=1., g=1., l=1., model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from multiple trajectories."""
     t0, state_scale, mg = _physical_state_scale(m, g, l)
     u_all = [F / mg for F in F_all]  # Assuming normalized input
@@ -556,48 +559,53 @@ def lqr(A, B, Q, R):
 
 def lqr_ct(A, B, Q, R):
     """Computes the infinite-horizon LQR gain matrix K for continuous-time system."""
-    from scipy.linalg import solve_continuous_are
+    
 
     P = solve_continuous_are(A, B, Q, R)
     K = np.linalg.solve(R, B.T @ P)
 
     return K
 
-def lqr_4state_u_caller(M, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
-    """Builds a normalized-input LQR controller on the original 4-state linearization."""
-    A, B = linearize_upright_dynamics(M)
-
-    if Q is None:
-        Q = np.diag([1.0, 1.0, 50.0, 10.0])
-    if R is None:
-        R = np.array([[0.1]])
+def lqr_u_caller(A, B, umax=10, y_ref=None, u_ref=0.0, Q=None, R=None, model_type="continuous", lift=dummy_lift):
+    """Builds a normalized-input LQR controller """
     if y_ref is None:
         y_ref = np.zeros(4)
+    if Q is None:
+        Q = np.diag([0, 10, 50, 10])
+    if R is None:
+        R = np.array([[1.0]])
 
-    K = lqr_ct(A, B, Q, R)
-    y_ref = np.asarray(y_ref, dtype=float).reshape(4)
+    if model_type == "continuous":
+        K = lqr_ct(A, B, Q, R)
+    elif model_type == "discrete":
+        K = lqr(A, B, Q, R)
+    else:
+        raise ValueError("model_type must be either 'continuous' or 'discrete'.")
+
+    z_ref = lift(y_ref)
 
     def u_caller(_, y):
-        y = np.asarray(y, dtype=float).reshape(4)
-        y_err = y - y_ref
-        u = u_ref - (K @ y_err).item()
+        z_err = lift(y) - z_ref
+        u = u_ref - (K @ z_err).item()
         return np.clip(u, -umax, umax)
 
-    return u_caller, K, A, B
+    return u_caller
 
-def lqr_4state_F_caller(M, m, g, l, Q=None, R=None, umax=10, y_ref=None, u_ref=0.0):
-    """Builds a force-based wrapper around the normalized 4-state LQR controller."""
+def lqr_F_caller(A, B, m=1., g=1., l=1., umax=10, y_ref=None, u_ref=0.0, Q=None, R=None, model_type="continuous", lift=dummy_lift):
+    """Builds a force-based wrapper around the normalized lifted-system LQR controller."""
     t0, state_scale, mg = _physical_state_scale(m, g, l)
-    u_caller, K, A, B = lqr_4state_u_caller(
-        M=M/m,
+    u_caller = lqr_u_caller(
+        A=A,
+        B=B,
+        umax=umax,
+        y_ref=y_ref,
+        u_ref=u_ref,
         Q=Q,
         R=R,
-        umax=umax,
-        y_ref=y_ref/state_scale if y_ref is not None else None,
-        u_ref=u_ref,
+        model_type=model_type,
+        lift=lift
     )
-    F_caller = wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
-    return F_caller, K, A, B
+    return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l) 
 
 def solve_nonlinear_mpc(y0, M, Q=None, R=None, Qf=None, horizon=25, dt=0.05,
                         umax=10.0, y_ref=None, u_ref=0.0, u_guess=None,
@@ -886,54 +894,6 @@ def quadratic_tracking_cost(x_vars, u_vars, Q, R, x_ref=None, u_ref=None):
     mterm = x_cost
 
     return lterm, mterm
-
-def lqr_u_caller(A, B, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, model_type="continuous"):
-    """Builds a normalized-input LQR controller on the lifted system."""
-    C = np.array([
-        [1, 0, 0, 0, 0, 0, 0],   # x
-        [0, 1, 0, 0, 0, 0, 0],   # xdot
-        [0, 0, 1, 0, 0, 0, 0],   # theta
-        [0, 0, 0, 1, 0, 0, 0],   # thetadot
-    ])
-    if y_ref is None:
-        y_ref = np.zeros(4)
-    if Q_phys is None:
-        Q_phys = np.diag([0, 10, 50, 10])
-    if R is None:
-        R = np.array([[1.0]])
-
-    Q_z = C.T @ Q_phys @ C # TODO: Check this, C doesnt look right
-
-    if model_type == "continuous":
-        K = lqr_ct(A, B, Q_z, R)
-    elif model_type == "discrete":
-        K = lqr(A, B, Q_z, R)
-    else:
-        raise ValueError("model_type must be either 'continuous' or 'discrete'.")
-
-    z_ref = lift(y_ref)
-
-    def u_caller(_, y):
-        z_err = lift(y) - z_ref
-        u = u_ref - (K @ z_err).item()
-        return np.clip(u, -umax, umax)
-
-    return u_caller
-
-def lqr_F_caller(A, B, m, g, l, umax=10, y_ref=None, u_ref=0.0, Q_phys=None, R=None, model_type="continuous"):
-    """Builds a force-based wrapper around the normalized lifted-system LQR controller."""
-    t0, state_scale, mg = _physical_state_scale(m, g, l)
-    u_caller = lqr_u_caller(
-        A=A,
-        B=B,
-        umax=umax,
-        y_ref=y_ref,
-        u_ref=u_ref,
-        Q_phys=Q_phys,
-        R=R,
-        model_type=model_type,
-    )
-    return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l) 
 
 def deepc_caller(t_all, X_all, u_all, x_tar, dt=0.02, Q=None, R=None, horizon=25, memory=50, umax=1000.0, lambda_g=1e-3, lambda_y=1e-3, lift=dummy_lift,
                  y_max=1000.0, f_horizon=1, verbose=False):

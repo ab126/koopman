@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -216,6 +217,10 @@ def animate_point_mass(t, x, theta, l, F, case_name='', frame_step = 2, interval
 
 def save_animation(anim, filename):
     """Saves the animation to a file."""
+    # Create directory if it doesn't exist
+    directory = os.path.dirname(filename)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory)
     anim.save(filename, writer='ffmpeg', fps=30)
 
 # For concatenating generated trajectories
