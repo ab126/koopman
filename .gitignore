@@ -1,6 +1,9 @@
 venv/
+.venv/
 .idea/
 .ipynb_checkpoints/
 __pycache__/
+*.pyc
 /deepc/
+/PyDeepC/
 /saves/
