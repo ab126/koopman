@@ -1,5 +1,6 @@
 venv/
 .venv/
+manifoldControl/
 .idea/
 .ipynb_checkpoints/
 __pycache__/
