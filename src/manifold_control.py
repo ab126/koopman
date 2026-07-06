@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+import numpy as np
 from torch import nn
+
+from .core import wrap_u_caller_as_physical_F_caller
 
 
 TensorLike = torch.Tensor
@@ -358,7 +361,7 @@ class BehaviorManifoldControlSolver:
         Q: Optional[TensorLike] = None,
         R: Optional[TensorLike] = None,
         lambda_theta: float = 1.0,
-        lambda_curvature: float = 0.0,
+        lambda_curvature: float = 1.0,
         x_ref: Optional[TensorLike] = None,
         u_ref: Optional[TensorLike] = None,
         lr: float = 1e-3,
@@ -714,3 +717,151 @@ def _detach_loss_dict(loss_dict: Mapping[str, TensorLike]) -> Dict[str, float]:
         name: float(value.detach().cpu())
         for name, value in loss_dict.items()
     }
+
+
+# Inverted Pendlum Callers
+
+
+def manifold_u_caller(
+    decoder,
+    M,
+    H=25,
+    dt=0.05,
+    x_dim=4,
+    u_dim=1,
+    alpha_dim=8,
+    Q=None,
+    R=None,
+    x_ref=None,
+    u_ref=None,
+    umax=10.0,
+    lambda_theta=1.0,
+    lambda_curvature=1.0,
+    lr=1e-2,
+    max_iter=1000,
+):
+    """
+    Returns u_caller(t, y), where y is normalized state and u is normalized input.
+    """
+
+    device = next(decoder.parameters()).device
+
+    if Q is None:
+        Q = torch.diag(torch.tensor([1.0, 1.0, 80.0, 10.0], device=device))
+    if R is None:
+        R = torch.tensor([[0.1]], device=device)
+    if x_ref is None:
+        x_ref = torch.zeros(x_dim, device=device)
+    else:
+        x_ref = torch.as_tensor(x_ref, dtype=torch.float32, device=device)
+
+    if u_ref is None:
+        u_ref = torch.zeros(u_dim, device=device)
+    else:
+        u_ref = torch.as_tensor(u_ref, dtype=torch.float32, device=device)
+
+    for p in decoder.parameters():
+        p.requires_grad_(False)
+
+    state = {
+        "next_update_t": None,
+        "u_seq": np.zeros((H, u_dim)),
+        "x_seq": None,
+        "alpha": torch.zeros(alpha_dim, device=device),
+        "current_u": 0.0,
+    }
+
+    def u_caller(t, y):
+        y = np.asarray(y, dtype=float).reshape(x_dim)
+
+        if state["next_update_t"] is None or t >= state["next_update_t"] - 1e-12:
+            x_init = torch.zeros(H + 1, x_dim, device=device)
+            x_init[0] = torch.tensor(y, dtype=torch.float32, device=device)
+
+            # warm start predicted states if available
+            if state["x_seq"] is not None:
+                x_prev = state["x_seq"]
+                x_init[:-1] = torch.tensor(x_prev[1:], dtype=torch.float32, device=device)
+                x_init[-1] = x_init[-2]
+
+            u_init = torch.tensor(state["u_seq"], dtype=torch.float32, device=device)
+            alpha_init = state["alpha"].detach().clone()
+
+            solver = BehaviorManifoldControlSolver(
+                decoder=decoder,
+                x_dim=x_dim,
+                u_dim=u_dim,
+                horizon=H,
+                Q=Q,
+                R=R,
+                x_ref=x_ref,
+                u_ref=u_ref,
+                lambda_theta=lambda_theta,
+                lambda_curvature=lambda_curvature,
+                lr=lr,
+                max_iter=max_iter,
+                u_bounds=(-umax, umax),
+                curvature_mode="local",
+                device=device,
+            )
+
+            sol = solver.solve(
+                x_init=x_init,
+                u_init=u_init,
+                alpha_init=alpha_init,
+                freeze={ # Fix the decoder weights which is the trajectory manifold. Alpha is free parameter which is the latent coordinates on the manifold
+                    "theta": True, 
+                    "x": False,
+                    "u": False,
+                    "alpha": False,
+                },
+            )
+
+            u_opt = sol.u.detach().cpu().numpy()
+            x_opt = sol.x.detach().cpu().numpy()
+
+            state["current_u"] = float(u_opt[0, 0])
+            state["u_seq"] = np.vstack([u_opt[1:], u_opt[-1:]])
+            state["x_seq"] = x_opt
+            state["alpha"] = sol.alpha.detach().clone()
+            state["next_update_t"] = t + dt
+
+        return float(np.clip(state["current_u"], -umax, umax))
+
+    return u_caller
+
+
+def manifold_F_caller(
+    decoder,
+    M,
+    m,
+    g,
+    l,
+    H=25,
+    dt=0.05,
+    x_ref=None,
+    u_ref=0.0,
+    umax=10.0,
+    **kwargs,
+):
+    """
+    Returns F_caller(t, y_phys), matching the physical-unit interface expected by simulate().
+    """
+
+    u_caller = manifold_u_caller(
+        decoder=decoder,
+        M=M / m,
+        H=H,
+        dt=dt / np.sqrt(l / g),
+        x_ref=None if x_ref is None else np.asarray(x_ref) / np.array(
+            [l, l / np.sqrt(l / g), 1.0, 1.0 / np.sqrt(l / g)]
+        ),
+        u_ref=np.array([u_ref / (m * g)]),
+        umax=umax / (m * g),
+        **kwargs,
+    )
+
+    return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+
+
+
