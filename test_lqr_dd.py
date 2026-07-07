@@ -1,4 +1,4 @@
-from src.core import gen_max_theta_data, identify_sys_multiple_trajectories, linearize_upright_dynamics, lqr_F_caller, lqr_F_caller, simulate
+from src.inverted_pendulum import gen_max_theta_data, identify_sys_multiple_trajectories, linearize_upright_dynamics, lqr_F_caller, lqr_F_caller, simulate
 from src.plotting import animate, animate_point_mass, plot_results, save_animation
 import numpy as np
 from IPython.display import display, HTML

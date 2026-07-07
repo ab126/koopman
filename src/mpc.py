@@ -8,7 +8,7 @@ import do_mpc
 from pydeepc import DeePC
 from pydeepc.utils import Data
 
-from core import _physical_state_scale, dummy_lift, wrap_u_caller_as_physical_F_caller, quadratic_tracking_cost
+from src.inverted_pendulum import _physical_state_scale, dummy_lift, wrap_u_caller_as_physical_F_caller, quadratic_tracking_cost
 
 
 def module_mpc_F_caller(M, m, g, l, Q=None, R=None, model_type='continuous', horizon=20, dt=0.05, umax=10, y_ref=None, u_ref=0.0, rate_penalty=0.1):

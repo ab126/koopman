@@ -5,7 +5,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Rectangle
 import matplotlib.transforms as transforms
 
-def plot_results(t, x, x_dot, theta, theta_dot, u):
+def plot_results(t, x, x_dot, theta, theta_dot, u, save_path=None):
     """Plots the state trajectories and control input over time."""
 
     plt.figure(figsize=(12, 8))
@@ -28,6 +28,11 @@ def plot_results(t, x, x_dot, theta, theta_dot, u):
 
     plt.tight_layout()
     plt.show()
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path)
+        print(f"Saved plot to {save_path}")
     
 # ----------------------------
 # Animation

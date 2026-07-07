@@ -18,7 +18,7 @@ import numpy as np
 from torch import nn
 from pathlib import Path
 
-from .core import wrap_u_caller_as_physical_F_caller
+from .inverted_pendulum import wrap_u_caller_as_physical_F_caller
 
 
 TensorLike = torch.Tensor
@@ -878,7 +878,7 @@ def build_training_matrix(
     import numpy as np
     import torch
 
-    from src.core import _physical_state_scale
+    from src.inverted_pendulum import _physical_state_scale
 
     _, state_scale, mg = _physical_state_scale(m, g, l)
     rows = []
@@ -919,7 +919,7 @@ def make_decoder(
     ).to(device)
 
 
-def train_decoder(
+def train_decoder_old(
     W: "torch.Tensor",
     *,
     alpha_dim: int,
@@ -962,6 +962,137 @@ def train_decoder(
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(decoder.state_dict(), checkpoint)
     print(f"  saved decoder checkpoint to {checkpoint}")
+    return decoder
+
+
+def train_decoder(
+    W: "torch.Tensor",
+    *,
+    x_dim: int,
+    u_dim: int,
+    horizon: int,
+    alpha_dim: int,
+    hidden_dims: tuple[int, ...],
+    epochs: int,
+    max_iter: int,
+    lr: float,
+    print_every: int,
+    checkpoint: Path,
+    device: "torch.device",
+) -> "BehaviorDecoder":
+    """
+    Train the behavior decoder using the same optimization objective as
+    BehaviorManifoldControlSolver while freezing the trajectory variables.
+
+    Parameters
+    ----------
+    W : torch.Tensor, shape (n_samples, w_dim)
+        Training behavior vectors.
+
+    x_dim : int
+        State dimension.
+
+    u_dim : int
+        Input dimension.
+
+    horizon : int
+        Prediction horizon H.
+
+    alpha_dim : int
+        Latent manifold dimension.
+
+    hidden_dims : tuple[int, ...]
+        Hidden layer widths of the decoder MLP.
+
+    epochs : int
+        Number of passes over the training set.
+
+    lr : float
+        Optimizer learning rate.
+
+    print_every : int
+        Print progress every ``print_every`` epochs.
+
+    checkpoint : pathlib.Path
+        Output path for the trained decoder weights.
+
+    device : torch.device
+        Torch device.
+
+    Returns
+    -------
+    BehaviorDecoder
+        Trained decoder.
+    """
+    import torch
+
+    decoder = make_decoder(
+        alpha_dim=alpha_dim,
+        w_dim=W.shape[1],
+        hidden_dims=hidden_dims,
+        device=device,
+    )
+
+    solver = BehaviorManifoldControlSolver(
+        decoder=decoder,
+        x_dim=x_dim,
+        u_dim=u_dim,
+        horizon=horizon,
+        Q=torch.zeros(x_dim, x_dim, device=device),
+        R=torch.zeros(u_dim, u_dim, device=device),
+        lambda_theta=1.0,
+        lambda_curvature=1.0,
+        lr=lr,
+        max_iter=max_iter,
+        curvature_mode="local",
+        device=device,
+        dtype=W.dtype,
+    )
+
+    alpha_table = torch.randn(
+        W.shape[0],
+        alpha_dim,
+        dtype=W.dtype,
+        device=device,
+    ) * 0.1
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        epoch_fit = 0.0
+
+        for i in range(W.shape[0]):
+            sol = solver.solve(
+                x_init=torch.zeros(horizon + 1, x_dim, dtype=W.dtype, device=device),
+                u_init=torch.zeros(horizon, u_dim, dtype=W.dtype, device=device),
+                alpha_init=alpha_table[i],
+                w_target=W[i],
+                freeze={
+                    "theta": False,
+                    "x": True,
+                    "u": True,
+                    "alpha": False,
+                },
+            )
+
+            alpha_table[i] = sol.alpha.detach()
+
+            epoch_loss += sol.loss
+            epoch_fit += sol.loss_dict["fit"]
+
+        epoch_loss /= len(W)
+        epoch_fit /= len(W)
+
+        if print_every > 0 and epoch % print_every == 0:
+            print(
+                f"epoch={epoch:04d}, "
+                f"loss={epoch_loss:.6f}, "
+                f"fit={epoch_fit:.6f}"
+            )
+
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(decoder.state_dict(), checkpoint)
+    print(f"saved decoder checkpoint to {checkpoint}")
+
     return decoder
 
 
