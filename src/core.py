@@ -432,7 +432,7 @@ def identify_sys(x, x_dot, theta, theta_dot, F, m=1., g=1., l=1., t=None, model_
     u = F / (mg)  # Assuming normalized input
     return identify_sys_u(x, x_dot, theta, theta_dot, u, t=t/t0, model_type=model_type, lift=lift)
 
-def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True, method='ivp'):
+def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True, method='rk4'):
     """Generates state/input trajectories up to a maximum theta and then repeats."""
 
     t0, state_scale, mg = _physical_state_scale(m, g, l)

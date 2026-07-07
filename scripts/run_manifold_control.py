@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Run the manifold-control inverted-pendulum workflow from the notebook."""
 
 from __future__ import annotations
@@ -8,6 +7,8 @@ import math
 import torch
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
+
+from src.manifold_control import load_decoder, build_training_matrix, train_decoder
 
 if TYPE_CHECKING:
     import numpy as np
@@ -75,15 +76,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--solve-lr", type=float, default=1e-2)
-    parser.add_argument("--solve-max-iter", type=int, default=2000)
     parser.add_argument("--lambda-theta", type=float, default=1.0)
     parser.add_argument("--lambda-curvature", type=float, default=1.0)
-    parser.add_argument("--solve-umax", type=float, default=20.0)
-    parser.add_argument("--y0", type=parse_y0, default=[0.0, 0.0, 0.08, 0.0])
+    parser.add_argument("--y0", type=parse_y0, default=[0.0, 0.0, np.pi/40, 0.0])
 
-    parser.add_argument("--sim-umax", type=float, default=20.0)
-    parser.add_argument("--sim-max-iter", type=int, default=1000)
-    parser.add_argument("--sim-method", choices=("ivp", "rk4"), default="rk4")
+    parser.add_argument("--umax", type=float, default=20.0)
+    parser.add_argument("--max-iter", type=int, default=1000)
+    parser.add_argument("--method", choices=("ivp", "rk4"), default="rk4")
     parser.add_argument("--results-path", type=Path, default=Path("saves") / "simulation_results" / "inverted_pendulum_results.npz")
     parser.add_argument("--plot", action="store_true")
 
@@ -98,131 +97,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="torch device, for example 'cpu' or 'cuda'",
     )
     return parser
-
-
-def build_training_matrix(
-    X_all: Sequence[np.ndarray],
-    F_all: Sequence[np.ndarray],
-    *,
-    H: int,
-    m: float,
-    g: float,
-    l: float,
-    device: "torch.device",
-) -> "torch.Tensor":
-    import numpy as np
-    import torch
-
-    from src.core import _physical_state_scale
-
-    _, state_scale, mg = _physical_state_scale(m, g, l)
-    rows = []
-
-    for X, F in zip(X_all, F_all):
-        Xn = X / state_scale.reshape(4, 1)
-        un = F / mg
-        horizon_count = Xn.shape[1] - H - 1
-
-        for k in range(max(0, horizon_count)):
-            x_seq = Xn[:, k : k + H + 1].T
-            u_seq = un[k : k + H].reshape(H, 1)
-            rows.append(np.concatenate([x_seq.reshape(-1), u_seq.reshape(-1)]))
-
-    if not rows:
-        raise RuntimeError(
-            "no training windows were generated; try reducing H or increasing "
-            "num-points/t-span"
-        )
-
-    return torch.tensor(np.stack(rows), dtype=torch.float32, device=device)
-
-
-def make_decoder(
-    *,
-    alpha_dim: int,
-    w_dim: int,
-    hidden_dims: tuple[int, ...],
-    device: "torch.device",
-) -> "BehaviorDecoder":
-    from torch import nn
-
-    from src.manifold_control import BehaviorDecoder
-
-    return BehaviorDecoder(
-        alpha_dim=alpha_dim,
-        w_dim=w_dim,
-        hidden_dims=hidden_dims,
-        activation=nn.Tanh,
-    ).to(device)
-
-
-def train_decoder(
-    W: "torch.Tensor",
-    *,
-    alpha_dim: int,
-    hidden_dims: tuple[int, ...],
-    epochs: int,
-    lr: float,
-    lambda_alpha: float,
-    print_every: int,
-    checkpoint: Path,
-    device: "torch.device",
-) -> "BehaviorDecoder":
-    import torch
-    from torch import nn
-
-    decoder = make_decoder(
-        alpha_dim=alpha_dim,
-        w_dim=W.shape[1],
-        hidden_dims=hidden_dims,
-        device=device,
-    )
-    alpha_table = nn.Parameter(0.1 * torch.randn(W.shape[0], alpha_dim, device=device))
-    optimizer = torch.optim.Adam(list(decoder.parameters()) + [alpha_table], lr=lr)
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        W_hat = decoder(alpha_table)
-        recon_loss = torch.mean((W - W_hat) ** 2)
-        alpha_reg = torch.mean(alpha_table**2)
-        loss = recon_loss + lambda_alpha * alpha_reg
-        loss.backward()
-        optimizer.step()
-
-        if print_every > 0 and epoch % print_every == 0:
-            print(
-                f"  epoch={epoch:04d}, "
-                f"loss={loss.item():.6f}, "
-                f"recon={recon_loss.item():.6f}"
-            )
-
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(decoder.state_dict(), checkpoint)
-    print(f"  saved decoder checkpoint to {checkpoint}")
-    return decoder
-
-
-def load_decoder(
-    *,
-    checkpoint: Path,
-    alpha_dim: int,
-    w_dim: int,
-    hidden_dims: tuple[int, ...],
-    device: "torch.device",
-) -> "BehaviorDecoder":
-    import torch
-
-    decoder = make_decoder(
-        alpha_dim=alpha_dim,
-        w_dim=w_dim,
-        hidden_dims=hidden_dims,
-        device=device,
-    )
-    state_dict = torch.load(checkpoint, map_location=device)
-    decoder.load_state_dict(state_dict)
-    decoder.eval()
-    return decoder
-
 
 def solve_single_step(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None:
     import torch
@@ -250,8 +124,8 @@ def solve_single_step(args: argparse.Namespace, decoder: "BehaviorDecoder") -> N
         lambda_theta=args.lambda_theta,
         lambda_curvature=args.lambda_curvature,
         lr=args.solve_lr,
-        max_iter=args.solve_max_iter,
-        u_bounds=(-args.solve_umax, args.solve_umax),
+        max_iter=args.max_iter,
+        u_bounds=(-args.umax, args.umax),
         curvature_mode="local",
         device=device,
     )
@@ -272,6 +146,7 @@ def solve_single_step(args: argparse.Namespace, decoder: "BehaviorDecoder") -> N
     print(f"  first control={u_plan[0, 0]:.6f}")
 
 
+
 def run_simulation(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None:
     import numpy as np
 
@@ -287,8 +162,8 @@ def run_simulation(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None
         l=args.l,
         H=args.H,
         dt=dt,
-        umax=args.sim_umax,
-        max_iter=args.sim_max_iter,
+        umax=args.umax,
+        max_iter=args.max_iter,
     )
 
     t, x, x_dot, theta, theta_dot, F_seq = simulate(
@@ -300,7 +175,7 @@ def run_simulation(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None
         y0=args.y0,
         t_span=args.t_span,
         num_points=args.num_points,
-        method=args.sim_method,
+        method=args.method,
         verbose=True,
     )
 
@@ -406,9 +281,9 @@ def main() -> None:
         decoder.eval()
 
     if args.skip_control_solve:
-        print("Step 3/4: skipping open-loop control solve")
+        print("Step 3/4: skipping one-step control solve")
     else:
-        print("Step 3/4: solving frozen-decoder open-loop control problem")
+        print("Step 3/4: solving frozen-decoder one-step control problem")
         solve_single_step(args, decoder)
 
     if args.skip_simulation:

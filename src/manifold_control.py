@@ -16,6 +16,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 import torch
 import numpy as np
 from torch import nn
+from pathlib import Path
 
 from .core import wrap_u_caller_as_physical_F_caller
 
@@ -721,7 +722,6 @@ def _detach_loss_dict(loss_dict: Mapping[str, TensorLike]) -> Dict[str, float]:
 
 # Inverted Pendlum Callers
 
-
 def manifold_u_caller(
     decoder,
     M,
@@ -862,6 +862,130 @@ def manifold_F_caller(
     )
 
     return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
+
+
+# Helpers
+def build_training_matrix(
+    X_all: Sequence[np.ndarray],
+    F_all: Sequence[np.ndarray],
+    *,
+    H: int,
+    m: float,
+    g: float,
+    l: float,
+    device: "torch.device",
+) -> "torch.Tensor":
+    import numpy as np
+    import torch
+
+    from src.core import _physical_state_scale
+
+    _, state_scale, mg = _physical_state_scale(m, g, l)
+    rows = []
+
+    for X, F in zip(X_all, F_all):
+        Xn = X / state_scale.reshape(4, 1)
+        un = F / mg
+        horizon_count = Xn.shape[1] - H - 1
+
+        for k in range(max(0, horizon_count)):
+            x_seq = Xn[:, k : k + H + 1].T
+            u_seq = un[k : k + H].reshape(H, 1)
+            rows.append(np.concatenate([x_seq.reshape(-1), u_seq.reshape(-1)]))
+
+    if not rows:
+        raise RuntimeError(
+            "no training windows were generated; try reducing H or increasing "
+            "num-points/t-span"
+        )
+
+    return torch.tensor(np.stack(rows), dtype=torch.float32, device=device)
+
+
+def make_decoder(
+    *,
+    alpha_dim: int,
+    w_dim: int,
+    hidden_dims: tuple[int, ...],
+    device: "torch.device",
+) -> "BehaviorDecoder":
+    from torch import nn
+
+    return BehaviorDecoder(
+        alpha_dim=alpha_dim,
+        w_dim=w_dim,
+        hidden_dims=hidden_dims,
+        activation=nn.Tanh,
+    ).to(device)
+
+
+def train_decoder(
+    W: "torch.Tensor",
+    *,
+    alpha_dim: int,
+    hidden_dims: tuple[int, ...],
+    epochs: int,
+    lr: float,
+    lambda_alpha: float,
+    print_every: int,
+    checkpoint: Path,
+    device: "torch.device",
+) -> "BehaviorDecoder":
+    import torch
+    from torch import nn
+
+    decoder = make_decoder(
+        alpha_dim=alpha_dim,
+        w_dim=W.shape[1],
+        hidden_dims=hidden_dims,
+        device=device,
+    )
+    alpha_table = nn.Parameter(0.1 * torch.randn(W.shape[0], alpha_dim, device=device))
+    optimizer = torch.optim.Adam(list(decoder.parameters()) + [alpha_table], lr=lr)
+
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        W_hat = decoder(alpha_table)
+        recon_loss = torch.mean((W - W_hat) ** 2)
+        alpha_reg = torch.mean(alpha_table**2)
+        loss = recon_loss + lambda_alpha * alpha_reg
+        loss.backward()
+        optimizer.step()
+
+        if print_every > 0 and epoch % print_every == 0:
+            print(
+                f"  epoch={epoch:04d}, "
+                f"loss={loss.item():.6f}, "
+                f"recon={recon_loss.item():.6f}"
+            )
+
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(decoder.state_dict(), checkpoint)
+    print(f"  saved decoder checkpoint to {checkpoint}")
+    return decoder
+
+
+def load_decoder(
+    *,
+    checkpoint: Path,
+    alpha_dim: int,
+    w_dim: int,
+    hidden_dims: tuple[int, ...],
+    device: "torch.device",
+) -> "BehaviorDecoder":
+    import torch
+
+    decoder = make_decoder(
+        alpha_dim=alpha_dim,
+        w_dim=w_dim,
+        hidden_dims=hidden_dims,
+        device=device,
+    )
+    state_dict = torch.load(checkpoint, map_location=device)
+    decoder.load_state_dict(state_dict)
+    decoder.eval()
+    return decoder
+
 
 
 
