@@ -1,5 +1,6 @@
 import numpy as np
 from tqdm import tqdm
+from typing import Sequence
 
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize
@@ -471,6 +472,42 @@ def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), nu
         F_all.append(F)
     
     return t_all, X_all, F_all
+
+def build_inv_pend_training_matrix(
+    X_all: Sequence[np.ndarray],
+    F_all: Sequence[np.ndarray],
+    *,
+    H: int,
+    m: float,
+    g: float,
+    l: float,
+    device: "torch.device",
+) -> "torch.Tensor":
+    import numpy as np
+    import torch
+
+    from src.inverted_pendulum import _physical_state_scale
+
+    _, state_scale, mg = _physical_state_scale(m, g, l)
+    rows = []
+
+    for X, F in zip(X_all, F_all):
+        Xn = X / state_scale.reshape(4, 1)
+        un = F / mg
+        horizon_count = Xn.shape[1] - H - 1
+
+        for k in range(max(0, horizon_count)):
+            x_seq = Xn[:, k : k + H + 1].T
+            u_seq = un[k : k + H].reshape(H, 1)
+            rows.append(np.concatenate([x_seq.reshape(-1), u_seq.reshape(-1)]))
+
+    if not rows:
+        raise RuntimeError(
+            "no training windows were generated; try reducing H or increasing "
+            "num-points/t-span"
+        )
+
+    return torch.tensor(np.stack(rows), dtype=torch.float32, device=device)
 
 def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="continuous", lift=dummy_lift):
     """Identifies lifted system matrices from multiple trajectories."""

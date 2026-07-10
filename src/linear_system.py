@@ -287,7 +287,7 @@ def generate_linear_trajectory_data(
         Input matrix.
 
     num_steps : int
-        Number of control steps per trajectory.
+        Number of discrete time steps per trajectory.
 
     n_repeats : int
         Number of trajectories to generate.
@@ -361,84 +361,6 @@ def generate_linear_trajectory_data(
         U_all.append(U)
 
     return t_all, X_all, U_all
-
-
-def build_trajectory_training_matrix(
-    X_all: Sequence[Array],
-    U_all: Sequence[Array],
-    *,
-    horizon: int,
-    device: Optional["torch.device"] = None,
-    dtype: Optional["torch.dtype"] = None,
-) -> "torch.Tensor":
-    """
-    Build flattened trajectory windows for decoder training.
-
-    Each row is
-
-    ``w = [vec(x_0, ..., x_H), vec(u_0, ..., u_{H-1})]``.
-
-    Parameters
-    ----------
-    X_all : sequence of np.ndarray
-        State trajectories. Each entry has shape ``(x_dim, num_steps + 1)``.
-
-    U_all : sequence of np.ndarray
-        Input trajectories. Each entry has shape ``(u_dim, num_steps)``.
-
-    horizon : int
-        Window horizon ``H``.
-
-    device : torch.device, optional
-        Torch device for the returned tensor.
-
-    dtype : torch.dtype, optional
-        Torch dtype for the returned tensor. Defaults to ``torch.float32``.
-
-    Returns
-    -------
-    torch.Tensor, shape (n_windows, (H + 1) * x_dim + H * u_dim)
-        Training matrix of flattened trajectory windows.
-    """
-    import torch
-
-    if horizon <= 0:
-        raise ValueError("horizon must be positive.")
-    if len(X_all) != len(U_all):
-        raise ValueError("X_all and U_all must contain the same number of entries.")
-
-    rows = []
-
-    for X, U in zip(X_all, U_all):
-        X = np.asarray(X, dtype=float)
-        U = np.asarray(U, dtype=float)
-
-        if X.ndim != 2:
-            raise ValueError("each X must have shape (x_dim, num_steps + 1).")
-        if U.ndim != 2:
-            raise ValueError("each U must have shape (u_dim, num_steps).")
-        if X.shape[1] != U.shape[1] + 1:
-            raise ValueError("each X must have exactly one more time point than U.")
-
-        num_steps = U.shape[1]
-        n_windows = num_steps - horizon + 1
-
-        for k in range(max(0, n_windows)):
-            x_seq = X[:, k : k + horizon + 1].T
-            u_seq = U[:, k : k + horizon].T
-            rows.append(np.concatenate([x_seq.reshape(-1), u_seq.reshape(-1)]))
-
-    if not rows:
-        raise RuntimeError(
-            "no training windows were generated; try reducing horizon or "
-            "increasing num_steps"
-        )
-
-    return torch.tensor(
-        np.stack(rows),
-        dtype=dtype or torch.float32,
-        device=device,
-    )
 
 
 def simulate_discrete_closed_loop(

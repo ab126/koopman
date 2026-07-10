@@ -8,7 +8,7 @@ import torch
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
-from src.manifold_control import load_decoder, build_training_matrix, train_decoder
+from src.manifold_control import load_decoder, build_inv_pend_training_matrix, train_decoder
 
 if TYPE_CHECKING:
     import numpy as np
@@ -247,7 +247,7 @@ def main() -> None:
             n_repeats=args.n_repeats,
             method=args.data_method,
         )
-        W = build_training_matrix(
+        W = build_inv_pend_training_matrix(
             X_all,
             F_all,
             H=args.H,
