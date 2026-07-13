@@ -1020,6 +1020,14 @@ def train_decoder(
         device=device,
     ) * 0.1
 
+    print(
+        f"Training W={tuple(W.shape)}, "
+        f"alpha_table={(W.shape[0], alpha_dim)}, "
+        f"device={device}",
+        flush=True,
+    )
+
+
     for epoch in range(epochs):
         epoch_loss = 0.0
         epoch_fit = 0.0
@@ -1053,7 +1061,7 @@ def train_decoder(
                 f"fit={epoch_fit:.6f}"
             )
 
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True) # TODO: save every m epoch
     torch.save(decoder.state_dict(), checkpoint)
     print(f"saved decoder checkpoint to {checkpoint}")
 

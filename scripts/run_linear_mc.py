@@ -10,13 +10,14 @@ import torch
 
 from src.manifold_control import load_decoder, train_decoder
 from src.linear_system import (
-    build_trajectory_training_matrix,
     finite_horizon_lqr_u_caller,
     generate_linear_trajectory_data,
     is_controllable,
     sample_controllable_linear_system,
     simulate_discrete_closed_loop,
 )
+
+from src.manifold_control import build_trajectory_training_matrix
 
 if TYPE_CHECKING:
     import numpy as np
