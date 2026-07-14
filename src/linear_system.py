@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 
 Array = np.ndarray
@@ -414,7 +415,7 @@ def simulate_discrete_closed_loop(
 
     X[:, 0] = x0
 
-    for k in range(num_steps):
+    for k in tqdm(range(num_steps), desc="Simulation Steps", leave=False):
         u_k = np.asarray(u_caller(k, X[:, k]), dtype=float).reshape(u_dim)
         U[:, k] = u_k
         X[:, k + 1] = A @ X[:, k] + B @ u_k

@@ -164,7 +164,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def make_linear_manifold_u_caller(
+def make_linear_manifold_u_caller_args(
     args: argparse.Namespace,
     decoder: "BehaviorDecoder",
     Q: "torch.Tensor",
@@ -201,7 +201,6 @@ def make_linear_manifold_u_caller(
         Controller called as ``u_caller(k, x_k)``.
     """
     import numpy as np
-    import torch
 
     from src.manifold_control import BehaviorManifoldControlSolver
 
@@ -395,7 +394,7 @@ def run_simulation(
     """
     import numpy as np
 
-    u_manifold = make_linear_manifold_u_caller(
+    u_manifold = make_linear_manifold_u_caller_args(
         args=args,
         decoder=decoder,
         Q=Q,

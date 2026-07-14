@@ -11,7 +11,7 @@ trajectory space and ``w = [vec(x), vec(u)]``.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import torch
 import numpy as np
@@ -721,7 +721,7 @@ def _detach_loss_dict(loss_dict: Mapping[str, TensorLike]) -> Dict[str, float]:
     }
 
 
-# Inverted Pendlum Callers
+# Inverted Pendulum Callers
 
 def manifold_u_caller(
     decoder,
@@ -865,6 +865,127 @@ def manifold_F_caller(
     return wrap_u_caller_as_physical_F_caller(u_caller, m, g, l)
 
 
+# Linear System Callers
+
+def make_linear_manifold_u_caller(
+    decoder: "BehaviorDecoder",
+    Q: "torch.Tensor",
+    R: "torch.Tensor",
+    x_ref: "torch.Tensor",
+    u_ref: "torch.Tensor",
+    H: int,
+    alpha_dim: int,
+    umax: float,
+    device: "torch.device",
+    solve_lr: float = 1e-3,
+    max_iter: int = 1000,
+    lambda_theta: float = 1.0,
+    lambda_curvature: float = 1.0,
+):
+    """Build a receding-horizon manifold controller for a linear discrete system.
+
+    Parameters
+    ----------
+    decoder : BehaviorDecoder
+        Trained behavior decoder mapping latent codes to states/outputs.
+    Q : torch.Tensor
+        State cost matrix (torch.tensor, x_dim x x_dim).
+    R : torch.Tensor
+        Input cost matrix (torch.tensor, u_dim x u_dim).
+    x_ref : torch.Tensor
+        Reference state vector (torch.tensor, x_dim).
+    u_ref : torch.Tensor
+        Reference input vector (torch.tensor, u_dim).
+    H : int
+        Planning horizon (number of timesteps).
+    alpha_dim : int
+        Dimension of the latent code/behavior parameter alpha.
+    umax : float
+        Maximum (absolute) input value for saturation.
+    device : torch.device or str
+        Device to run torch tensors on (e.g. 'cpu' or 'cuda').
+    solve_lr : float, optional
+        Learning rate for the internal solver updating alpha (default 1e-3).
+    max_iter : int, optional
+        Maximum iterations for the internal solver (default 1000).
+    lambda_theta : float, optional
+        Regularization weight on parameter deviation (default 1.0).
+    lambda_curvature : float, optional
+        Regularization weight on curvature of the manifold (default 1.0).
+
+    Returns
+    -------
+    callable
+        Controller called as ``u_caller(k, x_k)`` returning a numpy array control input.
+    """
+    import numpy as np
+
+    from src.manifold_control import BehaviorManifoldControlSolver
+
+    device = torch.device(device)
+    u_dim = u_ref.shape[0]
+    x_dim = x_ref.shape[0]
+
+    for parameter in decoder.parameters():
+        parameter.requires_grad_(False)
+
+    state = {
+        "u_seq": np.zeros((H, u_dim)),
+        "x_seq": None,
+        "alpha": torch.zeros(alpha_dim, device=device),
+    }
+
+    def u_caller(k: int, x: "np.ndarray") -> "np.ndarray":
+        x = np.asarray(x, dtype=float).reshape(x_dim)
+
+        x_init = torch.zeros(H + 1, x_dim, device=device)
+        x_init[0] = torch.tensor(x, dtype=torch.float32, device=device)
+
+        if state["x_seq"] is not None:
+            x_prev = state["x_seq"]
+            x_init[:-1] = torch.tensor(x_prev[1:], dtype=torch.float32, device=device)
+            x_init[-1] = x_init[-2]
+
+        u_init = torch.tensor(state["u_seq"], dtype=torch.float32, device=device)
+        alpha_init = state["alpha"].detach().clone()
+
+        solver = BehaviorManifoldControlSolver(
+            decoder=decoder,
+            x_dim=x_dim,
+            u_dim=u_dim,
+            horizon=H,
+            Q=Q,
+            R=R,
+            x_ref=x_ref,
+            u_ref=u_ref,
+            lambda_theta=lambda_theta,
+            lambda_curvature=lambda_curvature,
+            lr=solve_lr,
+            max_iter=max_iter,
+            u_bounds=(-umax, umax),
+            curvature_mode="local",
+            device=device,
+        )
+
+        sol = solver.solve(
+            x_init=x_init,
+            u_init=u_init,
+            alpha_init=alpha_init,
+            freeze={"theta": True, "x": False, "u": False, "alpha": False},
+        )
+
+        u_opt = sol.u.detach().cpu().numpy()
+        x_opt = sol.x.detach().cpu().numpy()
+
+        state["u_seq"] = np.vstack([u_opt[1:], u_opt[-1:]])
+        state["x_seq"] = x_opt
+        state["alpha"] = sol.alpha.detach().clone()
+
+        return np.clip(u_opt[0], -umax, umax).reshape(u_dim)
+
+    return u_caller
+
+
 # Helpers
 def make_decoder(
     *,
@@ -903,7 +1024,7 @@ def train_decoder_old(
         w_dim=W.shape[1],
         hidden_dims=hidden_dims,
         device=device,
-    )
+    ).to(dtype=W.dtype)
     alpha_table = nn.Parameter(0.1 * torch.randn(W.shape[0], alpha_dim, device=device))
     optimizer = torch.optim.Adam(list(decoder.parameters()) + [alpha_table], lr=lr)
 
@@ -943,10 +1064,17 @@ def train_decoder(
     print_every: int,
     checkpoint: Path,
     device: "torch.device",
+    method: Literal["minibatch", "solver"] = "minibatch",
+    batch_size: int = 256,
+    lambda_alpha: float = 0.0,
 ) -> "BehaviorDecoder":
     """
-    Train the behavior decoder using the same optimization objective as
-    BehaviorManifoldControlSolver while freezing the trajectory variables.
+    Train the behavior decoder and one latent coordinate per behavior vector.
+
+    ``method="minibatch"`` (the default) jointly trains the decoder and latent
+    table with one optimizer step per minibatch.  ``method="solver"`` preserves
+    the original behavior: it invokes :class:`BehaviorManifoldControlSolver`
+    once per row of ``W`` and performs ``max_iter`` steps in every invocation.
 
     Parameters
     ----------
@@ -983,12 +1111,42 @@ def train_decoder(
     device : torch.device
         Torch device.
 
+    method : {"minibatch", "solver"}, optional
+        Decoder trainer.  The minibatch trainer is normally much faster.
+
+    batch_size : int, optional
+        Number of trajectories in each minibatch. Ignored by the solver
+        trainer. Values larger than the data set produce full-batch training.
+
+    lambda_alpha : float, optional
+        Weight of the mean squared latent-coordinate regularizer in minibatch
+        mode. The solver mode does not add this term.
+
     Returns
     -------
     BehaviorDecoder
         Trained decoder.
     """
     import torch
+
+    if W.ndim != 2 or W.shape[0] == 0:
+        raise ValueError("W must have shape (n_samples, w_dim) with n_samples > 0.")
+    expected_w_dim = (horizon + 1) * x_dim + horizon * u_dim
+    if W.shape[1] != expected_w_dim:
+        raise ValueError(
+            f"W has width {W.shape[1]}, but x_dim={x_dim}, u_dim={u_dim}, "
+            f"and horizon={horizon} require width {expected_w_dim}."
+        )
+    if method not in {"minibatch", "solver"}:
+        raise ValueError("method must be 'minibatch' or 'solver'.")
+    if epochs < 0:
+        raise ValueError("epochs must be non-negative.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if lambda_alpha < 0:
+        raise ValueError("lambda_alpha must be non-negative.")
+
+    W = W.to(device=device)
 
     decoder = make_decoder(
         alpha_dim=alpha_dim,
@@ -997,28 +1155,15 @@ def train_decoder(
         device=device,
     )
 
-    solver = BehaviorManifoldControlSolver(
-        decoder=decoder,
-        x_dim=x_dim,
-        u_dim=u_dim,
-        horizon=horizon,
-        Q=torch.zeros(x_dim, x_dim, device=device),
-        R=torch.zeros(u_dim, u_dim, device=device),
-        lambda_theta=1.0,
-        lambda_curvature=1.0,
-        lr=lr,
-        max_iter=max_iter,
-        curvature_mode="local",
-        device=device,
-        dtype=W.dtype,
+    alpha_table = torch.nn.Parameter(
+        torch.randn(
+            W.shape[0],
+            alpha_dim,
+            dtype=W.dtype,
+            device=device,
+        )
+        * 0.1
     )
-
-    alpha_table = torch.randn(
-        W.shape[0],
-        alpha_dim,
-        dtype=W.dtype,
-        device=device,
-    ) * 0.1
 
     print(
         f"Training W={tuple(W.shape)}, "
@@ -1026,42 +1171,87 @@ def train_decoder(
         f"device={device}",
         flush=True,
     )
+    if method == "minibatch":
+        optimizer = torch.optim.Adam(
+            [*decoder.parameters(), alpha_table], lr=lr
+        )
+        effective_batch_size = min(batch_size, len(W))
 
+        for epoch in range(epochs):
+            permutation = torch.randperm(len(W), device=device)
+            epoch_loss_sum = 0.0
+            epoch_fit_sum = 0.0
 
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        epoch_fit = 0.0
+            for start in range(0, len(W), effective_batch_size):
+                indices = permutation[start : start + effective_batch_size]
+                optimizer.zero_grad(set_to_none=True)
+                prediction = decoder(alpha_table[indices])
+                fit_loss = torch.mean((W[indices] - prediction) ** 2)
+                alpha_reg = torch.mean(alpha_table[indices] ** 2)
+                loss = fit_loss + lambda_alpha * alpha_reg
+                loss.backward()
+                optimizer.step()
 
-        for i in range(W.shape[0]):
-            sol = solver.solve(
-                x_init=torch.zeros(horizon + 1, x_dim, dtype=W.dtype, device=device),
-                u_init=torch.zeros(horizon, u_dim, dtype=W.dtype, device=device),
-                alpha_init=alpha_table[i],
-                w_target=W[i],
-                freeze={
-                    "theta": False,
-                    "x": True,
-                    "u": True,
-                    "alpha": False,
-                },
-            )
+                n_batch = indices.numel()
+                epoch_loss_sum += float(loss.detach()) * n_batch
+                epoch_fit_sum += float(fit_loss.detach()) * n_batch
 
-            alpha_table[i] = sol.alpha.detach()
+            epoch_loss = epoch_loss_sum / len(W)
+            epoch_fit = epoch_fit_sum / len(W)
+            if print_every > 0 and epoch % print_every == 0:
+                print(
+                    f"epoch={epoch:04d}, loss={epoch_loss:.6f}, "
+                    f"fit={epoch_fit:.6f}"
+                )
+    else:
+        solver = BehaviorManifoldControlSolver(
+            decoder=decoder,
+            x_dim=x_dim,
+            u_dim=u_dim,
+            horizon=horizon,
+            Q=torch.zeros(x_dim, x_dim, dtype=W.dtype, device=device),
+            R=torch.zeros(u_dim, u_dim, dtype=W.dtype, device=device),
+            lambda_theta=1.0,
+            lambda_curvature=1.0,
+            lr=lr,
+            max_iter=max_iter,
+            curvature_mode="local",
+            device=device,
+            dtype=W.dtype,
+        )
 
-            epoch_loss += sol.loss
-            epoch_fit += sol.loss_dict["fit"]
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            epoch_fit = 0.0
+            for i in range(W.shape[0]):
+                sol = solver.solve(
+                    x_init=torch.zeros(
+                        horizon + 1, x_dim, dtype=W.dtype, device=device
+                    ),
+                    u_init=torch.zeros(horizon, u_dim, dtype=W.dtype, device=device),
+                    alpha_init=alpha_table[i].detach(),
+                    w_target=W[i],
+                    freeze={
+                        "theta": False,
+                        "x": True,
+                        "u": True,
+                        "alpha": False,
+                    },
+                )
+                with torch.no_grad():
+                    alpha_table[i].copy_(sol.alpha)
+                epoch_loss += sol.loss
+                epoch_fit += sol.loss_dict["fit"]
 
-        epoch_loss /= len(W)
-        epoch_fit /= len(W)
+            epoch_loss /= len(W)
+            epoch_fit /= len(W)
+            if print_every > 0 and epoch % print_every == 0:
+                print(
+                    f"epoch={epoch:04d}, loss={epoch_loss:.6f}, "
+                    f"fit={epoch_fit:.6f}"
+                )
 
-        if print_every > 0 and epoch % print_every == 0:
-            print(
-                f"epoch={epoch:04d}, "
-                f"loss={epoch_loss:.6f}, "
-                f"fit={epoch_fit:.6f}"
-            )
-
-    checkpoint.parent.mkdir(parents=True, exist_ok=True) # TODO: save every m epoch
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(decoder.state_dict(), checkpoint)
     print(f"saved decoder checkpoint to {checkpoint}")
 
