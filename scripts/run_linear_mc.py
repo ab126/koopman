@@ -116,7 +116,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-repeats", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.0)
 
-    parser.add_argument("--alpha-dim", type=int, default=8)
+    parser.add_argument("--alpha-dim", type=int, default=14)
     parser.add_argument("--hidden-dims", type=parse_hidden_dims, default=(128, 128))
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--train-lr", type=float, default=1e-3)

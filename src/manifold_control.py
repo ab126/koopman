@@ -15,7 +15,7 @@ from typing import Callable, Dict, Iterable, List, Literal, Mapping, Optional, S
 
 import torch
 import numpy as np
-from torch import nn
+from torch import nn, seed
 from pathlib import Path
 
 from .inverted_pendulum import wrap_u_caller_as_physical_F_caller
@@ -112,7 +112,11 @@ class BehaviorManifoldSolution:
     loss_dict : dict
         Final component losses.
     history : list of dict
-        Per-iteration scalar loss diagnostics.
+        Sampled scalar loss diagnostics, or an empty list when history storage
+        is disabled.
+    iterations : int
+        Number of optimizer steps completed. This can be less than the
+        configured maximum when early stopping is enabled.
     """
 
     x: TensorLike
@@ -122,6 +126,7 @@ class BehaviorManifoldSolution:
     loss: float
     loss_dict: Dict[str, float]
     history: List[Dict[str, float]]
+    iterations: int = 0
 
 
 class ManifoldLoss:
@@ -226,7 +231,7 @@ class ManifoldLoss:
                 f"w and phi_theta(alpha) must have the same shape; got "
                 f"{tuple(w.shape)} and {tuple(w_hat.shape)}."
             )
-        fit_loss = torch.mean((w - w_hat) ** 2)
+        fit_loss = torch.sum((w - w_hat) ** 2)
 
         curvature_loss = x_seq.new_tensor(0.0)
         if self.lambda_curvature != 0.0 and self.curvature_mode != "none":
@@ -313,7 +318,7 @@ class VariableManager:
 
         return params
 
-
+# TODO: Add a seperate optimized online solver. It should first find the alpha (low dim optimization problem) then should not create a new instance of the solver each step but use the previous state and alpha efficiently
 class BehaviorManifoldControlSolver:
     """Gradient solver for behavior-manifold learning/control.
 
@@ -352,6 +357,19 @@ class BehaviorManifoldControlSolver:
         Elementwise lower and upper bounds for ``u`` applied after each step.
     x_bounds : tuple of float, optional
         Elementwise lower and upper bounds for ``x`` applied after each step.
+    min_iter : int, optional
+        Minimum optimizer steps before early stopping is allowed.
+    patience : int, optional
+        Stop after this many consecutive iterations without a relative loss
+        improvement larger than ``relative_loss_tol``. ``None`` disables
+        early stopping, preserving the previous fixed-iteration behavior.
+    relative_loss_tol : float, optional
+        Minimum relative decrease in loss that resets early-stopping patience.
+    store_history : bool, optional
+        Store scalar per-iteration diagnostics. Disabled by default to avoid
+        device synchronization on every optimizer step.
+    store_every : int, optional
+        Store every Nth iteration when ``store_history`` is enabled.
     """
 
     def __init__(
@@ -375,11 +393,26 @@ class BehaviorManifoldControlSolver:
         x_bounds: Optional[Tuple[float, float]] = None,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        min_iter: int = 0,
+        patience: Optional[int] = None,
+        relative_loss_tol: float = 0.0,
+        store_history: bool = False,
+        store_every: int = 1,
     ) -> None:
         if horizon <= 0:
             raise ValueError("horizon must be positive.")
         if x_dim <= 0 or u_dim <= 0:
             raise ValueError("x_dim and u_dim must be positive.")
+        if max_iter < 0:
+            raise ValueError("max_iter must be non-negative.")
+        if min_iter < 0:
+            raise ValueError("min_iter must be non-negative.")
+        if patience is not None and patience <= 0:
+            raise ValueError("patience must be positive or None.")
+        if relative_loss_tol < 0:
+            raise ValueError("relative_loss_tol must be non-negative.")
+        if store_every <= 0:
+            raise ValueError("store_every must be positive.")
 
         self.decoder = decoder
         self.x_dim = int(x_dim)
@@ -392,6 +425,11 @@ class BehaviorManifoldControlSolver:
         self.optimizer_cls = optimizer_cls
         self.u_bounds = u_bounds
         self.x_bounds = x_bounds
+        self.min_iter = int(min_iter)
+        self.patience = None if patience is None else int(patience)
+        self.relative_loss_tol = float(relative_loss_tol)
+        self.store_history = bool(store_history)
+        self.store_every = int(store_every)
 
         self.Q = self._as_tensor(Q, (self.x_dim, self.x_dim), torch.eye(self.x_dim))
         self.R = self._as_tensor(R, (self.u_dim, self.u_dim), torch.eye(self.u_dim))
@@ -477,9 +515,13 @@ class BehaviorManifoldControlSolver:
 
         optimizer = self.optimizer_cls(params, lr=self.lr)
         history: List[Dict[str, float]] = []
+        initial_state = x_seq[0].detach().clone()
+        best_loss: Optional[float] = None
+        stale_iterations = 0
+        completed_iterations = 0
 
         for iteration in range(self.max_iter):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss, loss_dict = self.loss_fn(
                 x_seq=x_seq,
                 u_seq=u_seq,
@@ -490,11 +532,34 @@ class BehaviorManifoldControlSolver:
             loss.backward()
             optimizer.step()
             self._project_bounds(x_seq, u_seq)
+            with torch.no_grad():
+                x_seq[0].copy_(initial_state)
+            completed_iterations = iteration + 1
 
-            scalar_dict = _detach_loss_dict(loss_dict)
-            history.append(scalar_dict)
+            if self.store_history and iteration % self.store_every == 0:
+                history.append(_detach_loss_dict(loss_dict))
             if callback is not None:
                 callback(iteration, loss, loss_dict)
+
+            if self.patience is not None:
+                current_loss = float(loss.detach())
+                if best_loss is None:
+                    best_loss = current_loss
+                    stale_iterations = 0
+                else:
+                    scale = max(abs(best_loss), torch.finfo(self.dtype).eps)
+                    relative_improvement = (best_loss - current_loss) / scale
+                    if relative_improvement > self.relative_loss_tol:
+                        best_loss = current_loss
+                        stale_iterations = 0
+                    else:
+                        stale_iterations += 1
+
+                if (
+                    completed_iterations >= self.min_iter
+                    and stale_iterations >= self.patience
+                ):
+                    break
 
         with torch.no_grad():
             final_loss, final_dict = self.loss_fn(
@@ -504,14 +569,17 @@ class BehaviorManifoldControlSolver:
                 w_target=w_target_t,
                 alpha_samples=alpha_samples_t,
             )
+            final_diagnostics = _detach_loss_dict(final_dict)
+            final_diagnostics["iterations"] = float(completed_iterations)
             solution = BehaviorManifoldSolution(
                 x=x_seq.detach().clone(),
                 u=u_seq.detach().clone(),
                 alpha=alpha.detach().clone(),
                 w_hat=self.decoder(alpha).detach().clone().reshape(-1),
                 loss=float(final_loss.detach().cpu()),
-                loss_dict=_detach_loss_dict(final_dict),
+                loss_dict=final_diagnostics,
                 history=history,
+                iterations=completed_iterations,
             )
         self.last_result = solution
         return solution
@@ -881,6 +949,7 @@ def make_linear_manifold_u_caller(
     max_iter: int = 1000,
     lambda_theta: float = 1.0,
     lambda_curvature: float = 1.0,
+    seed: int = 1234,
 ):
     """Build a receding-horizon manifold controller for a linear discrete system.
 
@@ -925,6 +994,8 @@ def make_linear_manifold_u_caller(
     device = torch.device(device)
     u_dim = u_ref.shape[0]
     x_dim = x_ref.shape[0]
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
 
     for parameter in decoder.parameters():
         parameter.requires_grad_(False)
@@ -932,7 +1003,11 @@ def make_linear_manifold_u_caller(
     state = {
         "u_seq": np.zeros((H, u_dim)),
         "x_seq": None,
-        "alpha": torch.zeros(alpha_dim, device=device),
+        "alpha": 0.1 * torch.randn(
+            alpha_dim,
+            generator=g,
+            device=device,
+        ),
     }
 
     def u_caller(k: int, x: "np.ndarray") -> "np.ndarray":
@@ -949,7 +1024,7 @@ def make_linear_manifold_u_caller(
         u_init = torch.tensor(state["u_seq"], dtype=torch.float32, device=device)
         alpha_init = state["alpha"].detach().clone()
 
-        solver = BehaviorManifoldControlSolver(
+        solver = BehaviorManifoldControlSolver( #TODO: Move it out of the u_caller
             decoder=decoder,
             x_dim=x_dim,
             u_dim=u_dim,
@@ -1003,51 +1078,6 @@ def make_decoder(
         activation=nn.Tanh,
     ).to(device)
 
-
-def train_decoder_old(
-    W: "torch.Tensor",
-    *,
-    alpha_dim: int,
-    hidden_dims: tuple[int, ...],
-    epochs: int,
-    lr: float,
-    lambda_alpha: float,
-    print_every: int,
-    checkpoint: Path,
-    device: "torch.device",
-) -> "BehaviorDecoder":
-    import torch
-    from torch import nn
-
-    decoder = make_decoder(
-        alpha_dim=alpha_dim,
-        w_dim=W.shape[1],
-        hidden_dims=hidden_dims,
-        device=device,
-    ).to(dtype=W.dtype)
-    alpha_table = nn.Parameter(0.1 * torch.randn(W.shape[0], alpha_dim, device=device))
-    optimizer = torch.optim.Adam(list(decoder.parameters()) + [alpha_table], lr=lr)
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        W_hat = decoder(alpha_table)
-        recon_loss = torch.mean((W - W_hat) ** 2)
-        alpha_reg = torch.mean(alpha_table**2)
-        loss = recon_loss + lambda_alpha * alpha_reg
-        loss.backward()
-        optimizer.step()
-
-        if print_every > 0 and epoch % print_every == 0:
-            print(
-                f"  epoch={epoch:04d}, "
-                f"loss={loss.item():.6f}, "
-                f"recon={recon_loss.item():.6f}"
-            )
-
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(decoder.state_dict(), checkpoint)
-    print(f"  saved decoder checkpoint to {checkpoint}")
-    return decoder
 
 
 def train_decoder(
@@ -1186,7 +1216,7 @@ def train_decoder(
                 indices = permutation[start : start + effective_batch_size]
                 optimizer.zero_grad(set_to_none=True)
                 prediction = decoder(alpha_table[indices])
-                fit_loss = torch.mean((W[indices] - prediction) ** 2)
+                fit_loss = torch.sum((W[indices] - prediction) ** 2)
                 alpha_reg = torch.mean(alpha_table[indices] ** 2)
                 loss = fit_loss + lambda_alpha * alpha_reg
                 loss.backward()
