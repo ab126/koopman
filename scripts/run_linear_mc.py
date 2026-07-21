@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from src.manifold_control import load_decoder, train_decoder
+from src.manifold_control import (
+    behavior_matrix_rank_summary,
+    evaluate_behavior_autoencoder,
+    load_autoencoder,
+    split_behavior_matrix,
+    train_decoder,
+)
 from src.linear_system import (
     finite_horizon_lqr_u_caller,
     generate_linear_trajectory_data,
@@ -120,7 +126,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dims", type=parse_hidden_dims, default=(128, 128))
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--train-lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lambda-alpha", type=float, default=0.0)
     parser.add_argument("--print-every", type=int, default=250)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--rank-tol",
+        type=float,
+        default=None,
+        help="matrix-rank tolerance (default: NumPy's automatic tolerance)",
+    )
     parser.add_argument(
         "--checkpoint",
         type=Path,
@@ -498,6 +513,8 @@ def main() -> None:
 
     device = torch.device(args.device)
     W = None
+    W_train = None
+    W_test = None
 
     if args.x0 is None:
         x0 = np.zeros(args.x_dim)
@@ -554,11 +571,39 @@ def main() -> None:
             dtype=torch.float32,
         )
         w_dim = W.shape[1]
-        print(f"  training matrix shape={tuple(W.shape)}")
+        W_train, W_test = split_behavior_matrix(
+            W, test_fraction=args.test_fraction, seed=args.seed
+        )
+        summaries = {
+            "W_all": behavior_matrix_rank_summary(W, tol=args.rank_tol),
+            "W_train": behavior_matrix_rank_summary(W_train, tol=args.rank_tol),
+            "W_test": behavior_matrix_rank_summary(W_test, tol=args.rank_tol),
+        }
+        print("behavior matrix:")
+        for name, summary in summaries.items():
+            print(
+                f"  {name} shape={summary['shape']}, "
+                f"uncentered rank={summary['rank']}, "
+                f"centered rank={summary['centered_rank']}"
+            )
+            singular_values = np.asarray(summary["leading_singular_values"])
+            print(
+                "    leading singular values="
+                f"{np.array2string(singular_values, precision=3)}"
+            )
+        expected_behavior_dim = args.x_dim + args.H * args.u_dim
+        print(
+            "  expected noiseless behavior dimension="
+            f"n + Hm={expected_behavior_dim}"
+        )
+        print(
+            "  rank tolerance="
+            f"{args.rank_tol if args.rank_tol is not None else 'NumPy default'}"
+        )
 
     if args.skip_training:
-        print("Step 3/4: loading decoder checkpoint")
-        decoder = load_decoder(
+        print("Step 3/4: loading autoencoder checkpoint")
+        autoencoder = load_autoencoder(
             checkpoint=args.checkpoint,
             alpha_dim=args.alpha_dim,
             w_dim=w_dim,
@@ -566,11 +611,11 @@ def main() -> None:
             device=device,
         )
     else:
-        if W is None:
+        if W_train is None:
             raise RuntimeError("training requires generated data")
-        print("Step 3/4: training manifold decoder")
-        decoder = train_decoder(
-            W,
+        print("Step 3/4: training behavior autoencoder")
+        autoencoder = train_decoder(
+            W_train,
             x_dim=args.x_dim,
             u_dim=args.u_dim,
             horizon=args.H,
@@ -582,8 +627,56 @@ def main() -> None:
             print_every=args.print_every,
             checkpoint=args.checkpoint,
             device=device,
+            batch_size=args.batch_size,
+            lambda_alpha=args.lambda_alpha,
         )
-        decoder.eval()
+    encoder = autoencoder.encoder
+    decoder = autoencoder.decoder
+    encoder.eval()
+    decoder.eval()
+
+    if W_train is not None and W_test is not None:
+        def print_autoencoder_metrics(label: str, matrix: "torch.Tensor") -> None:
+            metrics = evaluate_behavior_autoencoder(
+                encoder,
+                decoder,
+                matrix,
+                A=A,
+                B=B,
+                x_dim=args.x_dim,
+                u_dim=args.u_dim,
+                horizon=args.H,
+            )
+            print(f"{label} autoencoder metrics:")
+            print(
+                "  reconstruction: "
+                f"aggregate NRMSE={metrics['aggregate_nrmse']:.6g}, "
+                f"trajectory median={metrics['trajectory_nrmse_median']:.6g}, "
+                f"trajectory p95={metrics['trajectory_nrmse_p95']:.6g}, "
+                f"R^2={metrics['r2']:.6g}"
+            )
+            for residual_label, prefix in (
+                ("data dynamics residual", "data_dynamics_residual"),
+                ("reconstructed dynamics residual", "reconstructed_dynamics_residual"),
+            ):
+                print(
+                    f"  {residual_label}: "
+                    f"mean={metrics[prefix + '_mean']:.6g}, "
+                    f"median={metrics[prefix + '_median']:.6g}, "
+                    f"p95={metrics[prefix + '_p95']:.6g}, "
+                    f"max={metrics[prefix + '_max']:.6g}"
+                )
+
+        print_autoencoder_metrics("Train", W_train)
+        print_autoencoder_metrics("Test", W_test)
+
+    # Future DeePC comparison plan:
+    # 1. Generate one shared noiseless persistently exciting trajectory set.
+    # 2. Construct horizon-H DeePC Hankel matrices.
+    # 3. Match x0, reference, Q/R, bounds, and horizon across all controllers.
+    # 4. Compare model-based QR/LQR, linear representation, nonlinear decoder,
+    #    and DeePC using first/full input, state, objective, feasibility, and
+    #    dynamics differences; verify dimension n + Hm in the exact case.
 
     if args.skip_control_solve:
         print("Step 4/4: skipping control solve and simulation")

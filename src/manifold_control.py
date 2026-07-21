@@ -93,6 +93,79 @@ class BehaviorDecoder(nn.Module):
         return self.net(alpha)
 
 
+class BehaviorEncoder(nn.Module):
+    """Neural encoder for a trajectory-space behavior manifold.
+
+    Parameters
+    ----------
+    w_dim : int
+        Dimension of the flattened trajectory vector ``w``.
+    alpha_dim : int
+        Dimension of the unconstrained latent coordinate ``alpha``.
+    hidden_dims : sequence of int, optional
+        Decoder hidden widths. The encoder uses these widths in reverse order.
+    activation : callable, optional
+        Torch module class used between linear layers.
+
+    Notes
+    -----
+    The forward map has dimensions ``w_dim -> reversed(hidden_dims) ->
+    alpha_dim``. The output layer is linear. Batched inputs are supported.
+    """
+
+    def __init__(
+        self,
+        w_dim: int,
+        alpha_dim: int,
+        hidden_dims: Sequence[int] = (64, 64),
+        activation: Callable[[], nn.Module] = nn.Tanh,
+    ) -> None:
+        super().__init__()
+        if w_dim <= 0:
+            raise ValueError("w_dim must be positive.")
+        if alpha_dim <= 0:
+            raise ValueError("alpha_dim must be positive.")
+
+        dims = [w_dim, *reversed(hidden_dims), alpha_dim]
+        layers: List[nn.Module] = []
+        for in_dim, out_dim in zip(dims[:-2], dims[1:-1]):
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(activation())
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+
+        self.w_dim = int(w_dim)
+        self.alpha_dim = int(alpha_dim)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, w: TensorLike) -> TensorLike:
+        """Encode flattened behavior vectors.
+
+        Parameters
+        ----------
+        w : torch.Tensor
+            Behavior vector with trailing dimension ``w_dim``.
+
+        Returns
+        -------
+        torch.Tensor
+            Latent coordinates with trailing dimension ``alpha_dim``.
+        """
+
+        if w.shape[-1] != self.w_dim:
+            raise ValueError(
+                f"Expected w trailing dimension {self.w_dim}, got {w.shape[-1]}."
+            )
+        return self.net(w)
+
+
+@dataclass
+class BehaviorAutoencoder:
+    """Paired encoder and decoder for trajectory behavior vectors."""
+
+    encoder: BehaviorEncoder
+    decoder: BehaviorDecoder
+
+
 @dataclass
 class BehaviorManifoldSolution:
     """Container returned by :class:`BehaviorManifoldControlSolver`.
@@ -1079,6 +1152,24 @@ def make_decoder(
     ).to(device)
 
 
+def make_encoder(
+    *,
+    alpha_dim: int,
+    w_dim: int,
+    hidden_dims: tuple[int, ...],
+    device: "torch.device",
+) -> "BehaviorEncoder":
+    """Construct the mirrored behavior encoder used during training."""
+    from torch import nn
+
+    return BehaviorEncoder(
+        w_dim=w_dim,
+        alpha_dim=alpha_dim,
+        hidden_dims=hidden_dims,
+        activation=nn.Tanh,
+    ).to(device)
+
+
 
 def train_decoder(
     W: "torch.Tensor",
@@ -1097,14 +1188,14 @@ def train_decoder(
     method: Literal["minibatch", "solver"] = "minibatch",
     batch_size: int = 256,
     lambda_alpha: float = 0.0,
-) -> "BehaviorDecoder":
+) -> "BehaviorAutoencoder":
     """
-    Train the behavior decoder and one latent coordinate per behavior vector.
+    Train a paired behavior encoder and decoder.
 
-    ``method="minibatch"`` (the default) jointly trains the decoder and latent
-    table with one optimizer step per minibatch.  ``method="solver"`` preserves
-    the original behavior: it invokes :class:`BehaviorManifoldControlSolver`
-    once per row of ``W`` and performs ``max_iter`` steps in every invocation.
+    ``method="minibatch"`` (the default) trains an autoencoder with codes
+    predicted by the encoder. ``method="solver"`` preserves the legacy
+    per-sample latent-table training route and additionally fits the encoder to
+    the optimized table.
 
     Parameters
     ----------
@@ -1154,8 +1245,8 @@ def train_decoder(
 
     Returns
     -------
-    BehaviorDecoder
-        Trained decoder.
+    BehaviorAutoencoder
+        Trained encoder and decoder pair.
     """
     import torch
 
@@ -1183,27 +1274,23 @@ def train_decoder(
         w_dim=W.shape[1],
         hidden_dims=hidden_dims,
         device=device,
-    )
-
-    alpha_table = torch.nn.Parameter(
-        torch.randn(
-            W.shape[0],
-            alpha_dim,
-            dtype=W.dtype,
-            device=device,
-        )
-        * 0.1
-    )
+    ).to(dtype=W.dtype)
+    encoder = make_encoder(
+        alpha_dim=alpha_dim,
+        w_dim=W.shape[1],
+        hidden_dims=hidden_dims,
+        device=device,
+    ).to(dtype=W.dtype)
 
     print(
         f"Training W={tuple(W.shape)}, "
-        f"alpha_table={(W.shape[0], alpha_dim)}, "
+        f"method={method}, alpha_dim={alpha_dim}, "
         f"device={device}",
         flush=True,
     )
     if method == "minibatch":
         optimizer = torch.optim.Adam(
-            [*decoder.parameters(), alpha_table], lr=lr
+            [*encoder.parameters(), *decoder.parameters()], lr=lr
         )
         effective_batch_size = min(batch_size, len(W))
 
@@ -1215,9 +1302,10 @@ def train_decoder(
             for start in range(0, len(W), effective_batch_size):
                 indices = permutation[start : start + effective_batch_size]
                 optimizer.zero_grad(set_to_none=True)
-                prediction = decoder(alpha_table[indices])
-                fit_loss = torch.sum((W[indices] - prediction) ** 2)
-                alpha_reg = torch.mean(alpha_table[indices] ** 2)
+                alpha_pred = encoder(W[indices])
+                prediction = decoder(alpha_pred)
+                fit_loss = torch.mean((W[indices] - prediction) ** 2)
+                alpha_reg = torch.mean(alpha_pred**2)
                 loss = fit_loss + lambda_alpha * alpha_reg
                 loss.backward()
                 optimizer.step()
@@ -1234,6 +1322,12 @@ def train_decoder(
                     f"fit={epoch_fit:.6f}"
                 )
     else:
+        alpha_table = torch.nn.Parameter(
+            0.1
+            * torch.randn(
+                W.shape[0], alpha_dim, dtype=W.dtype, device=device
+            )
+        )
         solver = BehaviorManifoldControlSolver(
             decoder=decoder,
             x_dim=x_dim,
@@ -1281,11 +1375,88 @@ def train_decoder(
                     f"fit={epoch_fit:.6f}"
                 )
 
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(decoder.state_dict(), checkpoint)
-    print(f"saved decoder checkpoint to {checkpoint}")
+        encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=lr)
+        for _ in range(max(1, epochs)):
+            encoder_optimizer.zero_grad(set_to_none=True)
+            encoder_loss = torch.mean((encoder(W) - alpha_table.detach()) ** 2)
+            encoder_loss.backward()
+            encoder_optimizer.step()
 
-    return decoder
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "encoder_state_dict": encoder.state_dict(),
+            "decoder_state_dict": decoder.state_dict(),
+            "alpha_dim": alpha_dim,
+            "w_dim": W.shape[1],
+            "hidden_dims": tuple(hidden_dims),
+        },
+        checkpoint,
+    )
+    print(f"saved autoencoder checkpoint to {checkpoint}")
+
+    return BehaviorAutoencoder(encoder=encoder, decoder=decoder)
+
+
+def load_autoencoder(
+    *,
+    checkpoint: Path,
+    device: "torch.device",
+    alpha_dim: Optional[int] = None,
+    w_dim: Optional[int] = None,
+    hidden_dims: Optional[tuple[int, ...]] = None,
+) -> "BehaviorAutoencoder":
+    """Load an encoder-decoder checkpoint and validate architecture metadata.
+
+    Legacy decoder-only state dictionaries cannot reconstruct an encoder and
+    therefore produce a clear compatibility error.
+    """
+    import torch
+
+    payload = torch.load(checkpoint, map_location=device)
+    required = {
+        "encoder_state_dict",
+        "decoder_state_dict",
+        "alpha_dim",
+        "w_dim",
+        "hidden_dims",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise ValueError(
+            "Checkpoint is a legacy decoder-only checkpoint; retrain it to "
+            "create a conjugate encoder-decoder checkpoint."
+        )
+
+    saved_alpha_dim = int(payload["alpha_dim"])
+    saved_w_dim = int(payload["w_dim"])
+    saved_hidden_dims = tuple(int(dim) for dim in payload["hidden_dims"])
+    requested = (alpha_dim, w_dim, hidden_dims)
+    saved = (saved_alpha_dim, saved_w_dim, saved_hidden_dims)
+    labels = ("alpha_dim", "w_dim", "hidden_dims")
+    for label, expected, actual in zip(labels, requested, saved):
+        if expected is not None and expected != actual:
+            raise ValueError(
+                f"Checkpoint {label}={actual!r} does not match requested "
+                f"{label}={expected!r}."
+            )
+
+    encoder = make_encoder(
+        alpha_dim=saved_alpha_dim,
+        w_dim=saved_w_dim,
+        hidden_dims=saved_hidden_dims,
+        device=device,
+    )
+    decoder = make_decoder(
+        alpha_dim=saved_alpha_dim,
+        w_dim=saved_w_dim,
+        hidden_dims=saved_hidden_dims,
+        device=device,
+    )
+    encoder.load_state_dict(payload["encoder_state_dict"])
+    decoder.load_state_dict(payload["decoder_state_dict"])
+    encoder.eval()
+    decoder.eval()
+    return BehaviorAutoencoder(encoder=encoder, decoder=decoder)
 
 
 def load_decoder(
@@ -1296,18 +1467,201 @@ def load_decoder(
     hidden_dims: tuple[int, ...],
     device: "torch.device",
 ) -> "BehaviorDecoder":
-    import torch
-
-    decoder = make_decoder(
+    """Load the decoder from a conjugate autoencoder checkpoint."""
+    return load_autoencoder(
+        checkpoint=checkpoint,
         alpha_dim=alpha_dim,
         w_dim=w_dim,
         hidden_dims=hidden_dims,
         device=device,
-    )
-    state_dict = torch.load(checkpoint, map_location=device)
-    decoder.load_state_dict(state_dict)
+    ).decoder
+
+
+def split_behavior_matrix(
+    W: TensorLike,
+    *,
+    test_fraction: float = 0.2,
+    seed: Optional[int] = None,
+) -> Tuple[TensorLike, TensorLike]:
+    """Reproducibly split behavior rows into training and test sets.
+
+    Parameters
+    ----------
+    W : torch.Tensor, shape (n_samples, w_dim)
+        Behavior matrix with trajectories stored as rows.
+    test_fraction : float, optional
+        Fraction of rows assigned to the test set.
+    seed : int, optional
+        Seed for the local permutation generator.
+
+    Returns
+    -------
+    W_train, W_test : tuple of torch.Tensor
+        Nonempty row subsets on the same device as ``W``.
+    """
+
+    if W.ndim != 2 or W.shape[0] < 2:
+        raise ValueError("W must be two-dimensional with at least two rows.")
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must lie strictly between 0 and 1.")
+
+    test_size = min(W.shape[0] - 1, max(1, round(W.shape[0] * test_fraction)))
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+    indices = torch.randperm(W.shape[0], generator=generator)
+    test_indices = indices[:test_size].to(W.device)
+    train_indices = indices[test_size:].to(W.device)
+    return W[train_indices], W[test_indices]
+
+
+def behavior_matrix_rank_summary(
+    W: TensorLike,
+    *,
+    tol: Optional[float] = None,
+) -> Dict[str, object]:
+    """Summarize centered and uncentered ranks of a row-oriented matrix.
+
+    Parameters
+    ----------
+    W : array-like, shape (n_trajectories, w_dim)
+        Behavior vectors stored as rows.
+    tol : float, optional
+        Singular-value tolerance passed to ``numpy.linalg.matrix_rank``.
+
+    Returns
+    -------
+    dict
+        Shape, centered and uncentered ranks, and leading singular values.
+    """
+
+    matrix = W.detach().cpu().numpy() if torch.is_tensor(W) else np.asarray(W)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        raise ValueError("W must be a nonempty two-dimensional matrix.")
+    centered = matrix - matrix.mean(axis=0, keepdims=True)
+    rank_kwargs = {} if tol is None else {"tol": tol}
+    return {
+        "shape": tuple(matrix.shape),
+        "rank": int(np.linalg.matrix_rank(matrix, **rank_kwargs)),
+        "centered_rank": int(np.linalg.matrix_rank(centered, **rank_kwargs)),
+        "leading_singular_values": np.linalg.svd(matrix, compute_uv=False)[:5],
+    }
+
+
+def evaluate_behavior_autoencoder(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    W: TensorLike,
+    *,
+    A: TensorLike,
+    B: TensorLike,
+    x_dim: int,
+    u_dim: int,
+    horizon: int,
+    eps: float = 1e-12,
+) -> Dict[str, float]:
+    """Evaluate reconstruction quality and linear-system consistency.
+
+    Parameters
+    ----------
+    encoder, decoder : torch.nn.Module
+        Conjugate behavior encoder and decoder.
+    W : torch.Tensor, shape (n_samples, w_dim)
+        Behavior vectors stored as rows.
+    A : array-like, shape (x_dim, x_dim)
+        Linear state transition matrix.
+    B : array-like, shape (x_dim, u_dim)
+        Linear input matrix.
+    x_dim, u_dim, horizon : int
+        Trajectory dimensions and finite horizon.
+    eps : float, optional
+        Positive denominator floor.
+
+    Returns
+    -------
+    dict of str to float
+        Reconstruction NRMSE/R-squared metrics and normalized dynamics
+        residual summaries for both data and reconstructions.
+    """
+
+    expected_w_dim = (horizon + 1) * x_dim + horizon * u_dim
+    if W.ndim != 2 or W.shape[0] == 0 or W.shape[1] != expected_w_dim:
+        raise ValueError(
+            f"W must have shape (n_samples, {expected_w_dim}) with n_samples > 0."
+        )
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
+    parameter = next(encoder.parameters(), None)
+    if parameter is None:
+        W_eval = torch.as_tensor(W)
+        if not W_eval.is_floating_point():
+            W_eval = W_eval.to(dtype=torch.float32)
+    else:
+        W_eval = torch.as_tensor(W, device=parameter.device, dtype=parameter.dtype)
+    A_t = torch.as_tensor(A, device=W_eval.device, dtype=W_eval.dtype)
+    B_t = torch.as_tensor(B, device=W_eval.device, dtype=W_eval.dtype)
+    if tuple(A_t.shape) != (x_dim, x_dim):
+        raise ValueError(f"A must have shape {(x_dim, x_dim)}.")
+    if tuple(B_t.shape) != (x_dim, u_dim):
+        raise ValueError(f"B must have shape {(x_dim, u_dim)}.")
+
+    encoder.eval()
     decoder.eval()
-    return decoder
+    with torch.no_grad():
+        W_hat = decoder(encoder(W_eval))
+        error = W_eval - W_hat
+        aggregate_nrmse = torch.sqrt(torch.mean(error**2)) / torch.clamp(
+            torch.sqrt(torch.mean((W_eval - torch.mean(W_eval)) ** 2)), min=eps
+        )
+        row_rmse = torch.sqrt(torch.mean(error**2, dim=1))
+        row_scale = torch.sqrt(
+            torch.mean((W_eval - torch.mean(W_eval, dim=1, keepdim=True)) ** 2, dim=1)
+        )
+        row_nrmse = row_rmse / torch.clamp(row_scale, min=eps)
+        ss_res = torch.sum(error**2)
+        ss_tot = torch.sum((W_eval - torch.mean(W_eval, dim=0)) ** 2)
+        r2 = 1.0 - ss_res / torch.clamp(ss_tot, min=eps)
+
+        def normalized_dynamics_residuals(matrix: TensorLike) -> TensorLike:
+            x_size = (horizon + 1) * x_dim
+            x_hat = matrix[:, :x_size].reshape(-1, horizon + 1, x_dim)
+            u_hat = matrix[:, x_size:].reshape(-1, horizon, u_dim)
+            ax = torch.einsum("ij,bhj->bhi", A_t, x_hat[:, :-1])
+            bu = torch.einsum("ij,bhj->bhi", B_t, u_hat)
+            residual = torch.linalg.vector_norm(x_hat[:, 1:] - ax - bu, dim=-1)
+            denominator = (
+                torch.linalg.vector_norm(x_hat[:, 1:], dim=-1)
+                + torch.linalg.vector_norm(ax, dim=-1)
+                + torch.linalg.vector_norm(bu, dim=-1)
+            )
+            return residual / torch.clamp(denominator, min=eps)
+
+        data_residual = normalized_dynamics_residuals(W_eval).reshape(-1)
+        reconstructed_residual = normalized_dynamics_residuals(W_hat).reshape(-1)
+
+    row_nrmse_np = row_nrmse.cpu().numpy()
+
+    def residual_summary(prefix: str, values: TensorLike) -> Dict[str, float]:
+        values_np = values.cpu().numpy()
+        return {
+            f"{prefix}_mean": float(np.mean(values_np)),
+            f"{prefix}_median": float(np.median(values_np)),
+            f"{prefix}_p95": float(np.percentile(values_np, 95)),
+            f"{prefix}_max": float(np.max(values_np)),
+        }
+
+    metrics = {
+        "aggregate_nrmse": float(aggregate_nrmse.cpu()),
+        "trajectory_nrmse_median": float(np.median(row_nrmse_np)),
+        "trajectory_nrmse_p95": float(np.percentile(row_nrmse_np, 95)),
+        "r2": float(r2.cpu()),
+    }
+    metrics.update(residual_summary("data_dynamics_residual", data_residual))
+    metrics.update(
+        residual_summary("reconstructed_dynamics_residual", reconstructed_residual)
+    )
+    return metrics
 
 
 def build_trajectory_training_matrix(

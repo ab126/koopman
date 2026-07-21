@@ -30,10 +30,11 @@ def test_minibatch_is_default_and_does_not_use_solver(tmp_path, monkeypatch):
 
     monkeypatch.setattr(BehaviorManifoldControlSolver, "solve", fail_if_called)
     checkpoint = tmp_path / "decoder.pt"
-    decoder = train_decoder(W, batch_size=3, **_train_args(checkpoint))
+    autoencoder = train_decoder(W, batch_size=3, **_train_args(checkpoint))
 
     assert checkpoint.exists()
-    assert decoder(torch.zeros(4, 2)).shape == (4, 3)
+    assert autoencoder.decoder(torch.zeros(4, 2)).shape == (4, 3)
+    assert autoencoder.encoder(W[:4]).shape == (4, 2)
 
 
 def test_minibatch_updates_decoder_parameters(tmp_path):
@@ -48,22 +49,24 @@ def test_minibatch_updates_decoder_parameters(tmp_path):
     initial_params = [parameter.detach().clone() for parameter in initial.parameters()]
 
     torch.manual_seed(123)
-    decoder = train_decoder(W, batch_size=2, **_train_args(tmp_path / "decoder.pt"))
+    autoencoder = train_decoder(
+        W, batch_size=2, **_train_args(tmp_path / "decoder.pt")
+    )
 
     assert any(
         not torch.equal(before, after)
-        for before, after in zip(initial_params, decoder.parameters())
+        for before, after in zip(initial_params, autoencoder.decoder.parameters())
     )
 
 
 def test_solver_training_remains_available(tmp_path):
     W = torch.randn(2, 3)
-    decoder = train_decoder(
+    autoencoder = train_decoder(
         W,
         method="solver",
         **_train_args(tmp_path / "solver-decoder.pt"),
     )
-    assert decoder(torch.zeros(2)).shape == (3,)
+    assert autoencoder.decoder(torch.zeros(2)).shape == (3,)
 
 
 def test_train_decoder_rejects_unknown_method(tmp_path):

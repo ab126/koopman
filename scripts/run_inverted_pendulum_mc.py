@@ -272,7 +272,7 @@ def main() -> None:
         if W is None:
             raise RuntimeError("training requires generated data")
         print("Step 2/4: training manifold decoder")
-        decoder = train_decoder(
+        autoencoder = train_decoder(
             W,
             x_dim=4,
             u_dim=1,
@@ -286,6 +286,7 @@ def main() -> None:
             checkpoint=args.checkpoint,
             device=device,
         )
+        decoder = autoencoder.decoder
         decoder.eval()
 
     if args.skip_control_solve:
