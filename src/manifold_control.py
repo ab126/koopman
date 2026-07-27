@@ -720,6 +720,56 @@ def build_w(x_seq: TensorLike, u_seq: TensorLike) -> TensorLike:
     return torch.cat([x_seq.reshape(-1), u_seq.reshape(-1)], dim=0)
 
 
+def unpack_w(
+    w: TensorLike,
+    *,
+    x_dim: int,
+    u_dim: int,
+    horizon: int,
+) -> Tuple[TensorLike, TensorLike]:
+    """Unpack flattened behavior vectors into state and input trajectories.
+
+    Parameters
+    ----------
+    w : torch.Tensor
+        Behavior vector with shape ``(w_dim,)`` or batched vectors with shape
+        ``(..., w_dim)``.
+    x_dim : int
+        State dimension.
+    u_dim : int
+        Input dimension.
+    horizon : int
+        Number of control intervals.
+
+    Returns
+    -------
+    x_seq : torch.Tensor
+        State trajectory with shape ``(horizon + 1, x_dim)`` or
+        ``(..., horizon + 1, x_dim)``.
+    u_seq : torch.Tensor
+        Input trajectory with shape ``(horizon, u_dim)`` or
+        ``(..., horizon, u_dim)``.
+
+    Raises
+    ------
+    ValueError
+        If the trailing behavior-vector dimension is inconsistent with the
+        requested dimensions.
+    """
+    if x_dim <= 0 or u_dim <= 0 or horizon <= 0:
+        raise ValueError("x_dim, u_dim, and horizon must be positive.")
+    expected = (horizon + 1) * x_dim + horizon * u_dim
+    if w.ndim == 0 or w.shape[-1] != expected:
+        actual = 1 if w.ndim == 0 else w.shape[-1]
+        raise ValueError(f"Expected w_dim {expected}, got {actual}.")
+    x_size = (horizon + 1) * x_dim
+    prefix = w.shape[:-1]
+    return (
+        w[..., :x_size].reshape(*prefix, horizon + 1, x_dim),
+        w[..., x_size:].reshape(*prefix, horizon, u_dim),
+    )
+
+
 def quadratic_tracking_loss(
     x_seq: TensorLike,
     u_seq: TensorLike,
@@ -756,6 +806,370 @@ def quadratic_tracking_loss(
     x_cost = torch.einsum("...i,ij,...j->", x_err, Q, x_err)
     u_cost = torch.einsum("...i,ij,...j->", u_err, R, u_err)
     return x_cost + u_cost
+
+
+@dataclass
+class LatentMPCSolution:
+    """Result of a latent-only behavior MPC solve."""
+
+    x: TensorLike
+    u: TensorLike
+    alpha: TensorLike
+    w_hat: TensorLike
+    loss: float
+    tracking_loss: float
+    x0_rmse: float
+    x0_nrmse: float
+    max_input_violation: float
+    mean_input_violation: float
+    dynamics_residual_mean: Optional[float]
+    dynamics_residual_p95: Optional[float]
+    feasible: bool
+    iterations: int
+    outer_iterations: int
+    history: List[Dict[str, float]]
+    finite: bool = True
+
+
+class LatentBehaviorMPCSolver:
+    """Optimize only the latent coordinate of a frozen behavior decoder.
+
+    Decoding and all constraints are differentiable with respect to ``alpha``.
+    Costs and residuals are evaluated in physical coordinates, after optional
+    trajectory denormalization.
+    """
+
+    def __init__(
+        self,
+        decoder: nn.Module,
+        x_dim: int,
+        u_dim: int,
+        horizon: int,
+        Q: Optional[TensorLike] = None,
+        R: Optional[TensorLike] = None,
+        *,
+        encoder: Optional[nn.Module] = None,
+        x_ref: Optional[TensorLike] = None,
+        u_ref: Optional[TensorLike] = None,
+        Q_terminal: Optional[TensorLike] = None,
+        u_bounds: Optional[Tuple[TensorLike, TensorLike]] = None,
+        lambda_u_bounds: float = 1.0,
+        lambda_alpha: float = 0.0,
+        alpha_mean: Optional[TensorLike] = None,
+        alpha_std: Optional[TensorLike] = None,
+        A: Optional[TensorLike] = None,
+        B: Optional[TensorLike] = None,
+        lambda_dynamics: float = 0.0,
+        w_mean: Optional[TensorLike] = None,
+        w_std: Optional[TensorLike] = None,
+        x_scale: float = 1.0,
+        rho_x0_init: float = 1.0,
+        rho_x0_growth: float = 10.0,
+        rho_x0_max: float = 1e6,
+        constraint_tol: float = 1e-3,
+        max_outer_iter: int = 5,
+        inner_max_iter: int = 200,
+        lr: float = 1e-2,
+        min_inner_iter: int = 10,
+        patience: int = 20,
+        relative_loss_tol: float = 1e-6,
+        max_grad_norm: float = 10.0,
+        use_lbfgs_polish: bool = False,
+        lbfgs_max_iter: int = 20,
+        store_history: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+        eps: float = 1e-8,
+    ) -> None:
+        if min(x_dim, u_dim, horizon, max_outer_iter) <= 0:
+            raise ValueError("dimensions, horizon, and max_outer_iter must be positive.")
+        self.decoder = decoder
+        self.encoder = encoder
+        self.x_dim, self.u_dim, self.horizon = int(x_dim), int(u_dim), int(horizon)
+        try:
+            decoder_device = next(decoder.parameters()).device
+        except StopIteration:
+            decoder_device = torch.device("cpu")
+        self.device, self.dtype = device or decoder_device, dtype
+        self.w_dim = (horizon + 1) * x_dim + horizon * u_dim
+        if getattr(decoder, "w_dim", self.w_dim) != self.w_dim:
+            raise ValueError("Decoder output dimension is inconsistent with the horizon.")
+        self.Q = self._tensor(Q if Q is not None else torch.eye(x_dim), (x_dim, x_dim))
+        self.R = self._tensor(R if R is not None else torch.eye(u_dim), (u_dim, u_dim))
+        self.Q_terminal = self._tensor(
+            Q_terminal if Q_terminal is not None else self.Q, (x_dim, x_dim)
+        )
+        self.x_ref = self._tensor(
+            x_ref if x_ref is not None else torch.zeros(x_dim), (x_dim,)
+        )
+        self.u_ref = self._tensor(
+            u_ref if u_ref is not None else torch.zeros(u_dim), (u_dim,)
+        )
+        self.u_bounds = None
+        if u_bounds is not None:
+            self.u_bounds = (
+                torch.as_tensor(u_bounds[0], device=self.device, dtype=dtype),
+                torch.as_tensor(u_bounds[1], device=self.device, dtype=dtype),
+            )
+            for bound in self.u_bounds:
+                if bound.numel() not in (1, u_dim):
+                    raise ValueError("Input bounds must be scalar or per-input.")
+        self.A = None if A is None else self._tensor(A, (x_dim, x_dim))
+        self.B = None if B is None else self._tensor(B, (x_dim, u_dim))
+        if (self.A is None) != (self.B is None):
+            raise ValueError("A and B must be supplied together.")
+        self.lambda_u_bounds = float(lambda_u_bounds)
+        self.lambda_alpha = float(lambda_alpha)
+        self.lambda_dynamics = float(lambda_dynamics)
+        self.alpha_mean = self._optional(alpha_mean)
+        self.alpha_std = self._optional(alpha_std)
+        self.w_mean = self._normalizer(w_mean, 0.0)
+        self.w_std = self._normalizer(w_std, 1.0)
+        self.x_scale, self.rho_x0_init = float(x_scale), float(rho_x0_init)
+        self.rho_x0_growth, self.rho_x0_max = float(rho_x0_growth), float(rho_x0_max)
+        self.constraint_tol, self.max_outer_iter = float(constraint_tol), int(max_outer_iter)
+        self.inner_max_iter, self.lr = int(inner_max_iter), float(lr)
+        self.min_inner_iter, self.patience = int(min_inner_iter), int(patience)
+        self.relative_loss_tol, self.max_grad_norm = float(relative_loss_tol), float(max_grad_norm)
+        self.use_lbfgs_polish, self.lbfgs_max_iter = bool(use_lbfgs_polish), int(lbfgs_max_iter)
+        self.store_history, self.eps = bool(store_history), float(eps)
+        decoder.eval()
+        for parameter in decoder.parameters():
+            parameter.requires_grad_(False)
+        if encoder is not None:
+            encoder.eval()
+            for parameter in encoder.parameters():
+                parameter.requires_grad_(False)
+        self.last_result: Optional[LatentMPCSolution] = None
+
+    def _tensor(self, value: TensorLike, shape: Tuple[int, ...]) -> TensorLike:
+        result = torch.as_tensor(value, device=self.device, dtype=self.dtype)
+        if tuple(result.shape) != shape:
+            raise ValueError(f"Expected shape {shape}, got {tuple(result.shape)}.")
+        return result
+
+    def _optional(self, value: Optional[TensorLike]) -> Optional[TensorLike]:
+        return None if value is None else torch.as_tensor(value, device=self.device, dtype=self.dtype)
+
+    def _normalizer(self, value: Optional[TensorLike], default: float) -> TensorLike:
+        result = torch.full((self.w_dim,), default, device=self.device, dtype=self.dtype)
+        if value is not None:
+            result = self._tensor(value, (self.w_dim,))
+        return result
+
+    def normalize_w(self, w: TensorLike) -> TensorLike:
+        """Convert a physical trajectory vector to decoder coordinates."""
+        w = torch.as_tensor(w, device=self.device, dtype=self.dtype)
+        return (w - self.w_mean) / torch.clamp(self.w_std, min=self.eps)
+
+    def denormalize_w(self, w: TensorLike) -> TensorLike:
+        """Convert a decoder-coordinate trajectory vector to physical units."""
+        return w * self.w_std + self.w_mean
+
+    def encode_initial_trajectory(self, x_init: TensorLike, u_init: TensorLike) -> TensorLike:
+        """Encode a physical-unit initialization trajectory."""
+        if self.encoder is None:
+            raise ValueError("An encoder is required for trajectory initialization.")
+        x = self._tensor(x_init, (self.horizon + 1, self.x_dim))
+        u = self._tensor(u_init, (self.horizon, self.u_dim))
+        with torch.no_grad():
+            return self.encoder(self.normalize_w(build_w(x, u))).reshape(-1).detach()
+
+    def _decode(self, alpha: TensorLike) -> Tuple[TensorLike, TensorLike, TensorLike]:
+        w_hat = self.decoder(alpha).reshape(-1)
+        w_physical = self.denormalize_w(w_hat)
+        x, u = unpack_w(
+            w_physical, x_dim=self.x_dim, u_dim=self.u_dim, horizon=self.horizon
+        )
+        return w_hat, x, u
+
+    def _components(
+        self, alpha: TensorLike, x_current: TensorLike, multiplier: TensorLike, rho: float
+    ) -> Tuple[TensorLike, Dict[str, TensorLike]]:
+        w_hat, x, u = self._decode(alpha)
+        stage = quadratic_tracking_loss(
+            x[:-1], u, self.Q, self.R, self.x_ref, self.u_ref
+        )
+        terminal_error = x[-1] - self.x_ref
+        tracking = stage + terminal_error @ self.Q_terminal @ terminal_error
+        residual = x[0] - x_current
+        augmented = multiplier @ residual + 0.5 * rho * torch.sum(residual**2)
+        if self.u_bounds is None:
+            violation = torch.zeros_like(u)
+        else:
+            lower = torch.relu(self.u_bounds[0] - u)
+            upper = torch.relu(u - self.u_bounds[1])
+            violation = lower + upper
+        bound_loss = torch.mean(violation**2)
+        if self.alpha_mean is not None and self.alpha_std is not None:
+            alpha_reg = torch.mean(
+                ((alpha - self.alpha_mean) / torch.clamp(self.alpha_std.abs(), min=self.eps)) ** 2
+            )
+        else:
+            alpha_reg = torch.mean(alpha**2)
+        normalized_dynamics = None
+        dynamics_loss = alpha.new_tensor(0.0)
+        if self.A is not None and self.B is not None:
+            residual_d = x[1:] - x[:-1] @ self.A.T - u @ self.B.T
+            denominator = (
+                torch.linalg.vector_norm(x[1:], dim=-1)
+                + torch.linalg.vector_norm(x[:-1] @ self.A.T, dim=-1)
+                + torch.linalg.vector_norm(u @ self.B.T, dim=-1)
+            )
+            normalized_dynamics = torch.linalg.vector_norm(residual_d, dim=-1) / torch.clamp(
+                denominator, min=self.eps
+            )
+            dynamics_loss = torch.mean(normalized_dynamics**2)
+        total = (
+            tracking + augmented + self.lambda_u_bounds * bound_loss
+            + self.lambda_alpha * alpha_reg + self.lambda_dynamics * dynamics_loss
+        )
+        return total, {
+            "w_hat": w_hat, "x": x, "u": u, "tracking": tracking,
+            "initial_residual": residual, "violation": violation,
+            "bound_loss": bound_loss, "alpha_regularization": alpha_reg,
+            "normalized_dynamics": normalized_dynamics,
+            "dynamics_loss": dynamics_loss, "augmented_initial_loss": augmented,
+        }
+
+    def _solution(
+        self, alpha: TensorLike, x_current: TensorLike, multiplier: TensorLike,
+        rho: float, iterations: int, outer_iterations: int,
+        history: List[Dict[str, float]],
+    ) -> LatentMPCSolution:
+        with torch.no_grad():
+            loss, c = self._components(alpha, x_current, multiplier, rho)
+            residual = c["initial_residual"]
+            rmse = torch.sqrt(torch.mean(residual**2))
+            nrmse = torch.linalg.vector_norm(residual) / max(
+                float(torch.linalg.vector_norm(x_current)), self.x_scale, self.eps
+            )
+            violation = c["violation"]
+            dynamics = c["normalized_dynamics"]
+            finite = bool(torch.isfinite(loss) and torch.isfinite(alpha).all())
+            return LatentMPCSolution(
+                x=c["x"].detach().clone(), u=c["u"].detach().clone(),
+                alpha=alpha.detach().clone(), w_hat=c["w_hat"].detach().clone(),
+                loss=float(loss), tracking_loss=float(c["tracking"]),
+                x0_rmse=float(rmse), x0_nrmse=float(nrmse),
+                max_input_violation=float(violation.max()) if violation.numel() else 0.0,
+                mean_input_violation=float(violation.mean()) if violation.numel() else 0.0,
+                dynamics_residual_mean=None if dynamics is None else float(dynamics.mean()),
+                dynamics_residual_p95=None if dynamics is None else float(torch.quantile(dynamics, .95)),
+                feasible=finite and float(rmse) <= self.constraint_tol,
+                iterations=iterations, outer_iterations=outer_iterations,
+                history=history, finite=finite,
+            )
+
+    @staticmethod
+    def is_better(candidate: LatentMPCSolution, incumbent: Optional[LatentMPCSolution]) -> bool:
+        """Apply feasibility-first candidate ordering."""
+        if incumbent is None:
+            return candidate.finite
+        if candidate.feasible != incumbent.feasible:
+            return candidate.feasible
+        if candidate.feasible:
+            return candidate.tracking_loss < incumbent.tracking_loss
+        return (candidate.x0_rmse, candidate.loss) < (incumbent.x0_rmse, incumbent.loss)
+
+    def solve(
+        self,
+        x_current: TensorLike,
+        *,
+        alpha_init: Optional[TensorLike] = None,
+        x_init: Optional[TensorLike] = None,
+        u_init: Optional[TensorLike] = None,
+    ) -> LatentMPCSolution:
+        """Solve the latent MPC problem for a measured initial state."""
+        current = self._tensor(x_current, (self.x_dim,))
+        if alpha_init is None and x_init is not None and u_init is not None and self.encoder is not None:
+            alpha_init = self.encode_initial_trajectory(x_init, u_init)
+        alpha_dim = int(getattr(self.decoder, "alpha_dim"))
+        initial = torch.zeros(alpha_dim, device=self.device, dtype=self.dtype)
+        if alpha_init is not None:
+            initial = self._tensor(alpha_init, (alpha_dim,))
+        alpha = nn.Parameter(initial.detach().clone())
+        multiplier = torch.zeros(self.x_dim, device=self.device, dtype=self.dtype)
+        rho, previous_rmse = self.rho_x0_init, float("inf")
+        history: List[Dict[str, float]] = []
+        total_iterations = 0
+        best: Optional[LatentMPCSolution] = None
+        for outer in range(self.max_outer_iter):
+            optimizer = torch.optim.Adam([alpha], lr=self.lr)
+            best_inner, stale = float("inf"), 0
+            for _ in range(self.inner_max_iter):
+                optimizer.zero_grad(set_to_none=True)
+                loss, components = self._components(alpha, current, multiplier, rho)
+                if not torch.isfinite(loss):
+                    break
+                loss.backward()
+                if alpha.grad is None or not torch.isfinite(alpha.grad).all():
+                    break
+                torch.nn.utils.clip_grad_norm_([alpha], self.max_grad_norm)
+                optimizer.step()
+                total_iterations += 1
+                current_loss = float(loss.detach())
+                rmse = float(torch.sqrt(torch.mean(components["initial_residual"].detach() ** 2)))
+                improvement = (
+                    float("inf") if not np.isfinite(best_inner)
+                    else (best_inner - current_loss) / max(abs(best_inner), self.eps)
+                )
+                if current_loss < best_inner and improvement > self.relative_loss_tol:
+                    best_inner, stale = current_loss, 0
+                else:
+                    stale += 1
+                if self.store_history:
+                    history.append({"loss": current_loss, "x0_rmse": rmse, "rho_x0": rho})
+                if total_iterations >= self.min_inner_iter and stale >= self.patience and rmse <= self.constraint_tol:
+                    break
+            candidate = self._solution(alpha, current, multiplier, rho, total_iterations, outer + 1, history)
+            if self.is_better(candidate, best):
+                best = candidate
+            residual = candidate.x[0] - current
+            multiplier = multiplier + rho * residual.detach()
+            if candidate.x0_rmse <= self.constraint_tol:
+                break
+            if candidate.x0_rmse > 0.75 * previous_rmse:
+                rho = min(rho * self.rho_x0_growth, self.rho_x0_max)
+            previous_rmse = candidate.x0_rmse
+        if self.use_lbfgs_polish and best is not None and best.finite:
+            alpha = nn.Parameter(best.alpha.clone())
+            optimizer = torch.optim.LBFGS([alpha], max_iter=self.lbfgs_max_iter)
+            def closure() -> TensorLike:
+                optimizer.zero_grad(set_to_none=True)
+                value, _ = self._components(alpha, current, multiplier, rho)
+                value.backward()
+                torch.nn.utils.clip_grad_norm_([alpha], self.max_grad_norm)
+                return value
+            try:
+                optimizer.step(closure)
+                total_iterations += self.lbfgs_max_iter
+                polished = self._solution(
+                    alpha, current, multiplier, rho, total_iterations,
+                    best.outer_iterations, history
+                )
+                if self.is_better(polished, best):
+                    best = polished
+            except RuntimeError:
+                pass
+        if best is None:
+            best = self._solution(initial, current, multiplier, rho, total_iterations, 0, history)
+        self.last_result = best
+        return best
+
+    def solve_multistart(
+        self, x_current: TensorLike, alpha_initializations: Sequence[TensorLike]
+    ) -> LatentMPCSolution:
+        """Solve sequential latent starts and return the feasibility-first best."""
+        best = None
+        for initial in alpha_initializations:
+            candidate = self.solve(x_current, alpha_init=initial)
+            if self.is_better(candidate, best):
+                best = candidate
+        if best is None:
+            return self.solve(x_current)
+        self.last_result = best
+        return best
 
 
 def curvature_penalty_exact(decoder: nn.Module, alpha_samples: TensorLike) -> TensorLike:

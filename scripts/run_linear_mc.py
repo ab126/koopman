@@ -147,6 +147,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-curvature", type=float, default=0.0)
     parser.add_argument("--max-iter", type=int, default=1000)
     parser.add_argument("--umax", type=float, default=10.0)
+    parser.add_argument("--control-inner-max-iter", type=int, default=200)
+    parser.add_argument("--control-outer-max-iter", type=int, default=5)
+    parser.add_argument("--control-lr", type=float, default=1e-2)
+    parser.add_argument("--control-rho-x0", type=float, default=1.0)
+    parser.add_argument("--control-rho-growth", type=float, default=10.0)
+    parser.add_argument("--control-rho-max", type=float, default=1e6)
+    parser.add_argument("--control-constraint-tol", type=float, default=1e-3)
+    parser.add_argument("--control-lambda-u-bounds", type=float, default=100.0)
+    parser.add_argument("--control-lambda-alpha", type=float, default=0.0)
+    parser.add_argument("--control-lambda-dynamics", type=float, default=0.0)
+    parser.add_argument("--control-patience", type=int, default=20)
+    parser.add_argument("--control-relative-loss-tol", type=float, default=1e-6)
+    parser.add_argument("--control-multistart", type=int, default=1)
+    parser.add_argument("--control-lbfgs-polish", action="store_true")
 
     parser.add_argument("--q-scale", type=float, default=1.0)
     parser.add_argument("--r-scale", type=float, default=0.1)
@@ -186,6 +200,10 @@ def make_linear_manifold_u_caller_args(
     R: "torch.Tensor",
     x_ref: "torch.Tensor",
     u_ref: "torch.Tensor",
+    encoder=None,
+    A=None,
+    B=None,
+    fallback_controller=None,
 ):
     """
     Build a receding-horizon manifold controller for a linear discrete system.
@@ -217,67 +235,94 @@ def make_linear_manifold_u_caller_args(
     """
     import numpy as np
 
-    from src.manifold_control import BehaviorManifoldControlSolver
+    from src.manifold_control import LatentBehaviorMPCSolver
 
     device = torch.device(args.device)
 
-    for parameter in decoder.parameters():
-        parameter.requires_grad_(False)
-
+    solver = LatentBehaviorMPCSolver(
+        decoder, args.x_dim, args.u_dim, args.H, Q, R, encoder=encoder,
+        x_ref=x_ref, u_ref=u_ref, u_bounds=(-args.umax, args.umax),
+        lambda_u_bounds=args.control_lambda_u_bounds,
+        lambda_alpha=args.control_lambda_alpha,
+        A=A, B=B, lambda_dynamics=args.control_lambda_dynamics,
+        rho_x0_init=args.control_rho_x0, rho_x0_growth=args.control_rho_growth,
+        rho_x0_max=args.control_rho_max, constraint_tol=args.control_constraint_tol,
+        max_outer_iter=args.control_outer_max_iter,
+        inner_max_iter=args.control_inner_max_iter, lr=args.control_lr,
+        patience=args.control_patience,
+        relative_loss_tol=args.control_relative_loss_tol,
+        use_lbfgs_polish=args.control_lbfgs_polish, device=device,
+    )
     state = {
-        "u_seq": np.zeros((args.H, args.u_dim)),
-        "x_seq": None,
-        "alpha": torch.zeros(args.alpha_dim, device=device),
+        "previous_solution": None, "previous_alpha": None,
+        "previous_x_plan": None, "previous_u_plan": None,
+        "previous_feasible_u_plan": None,
     }
+    diagnostics = {key: [] for key in (
+        "solver_iterations", "solver_outer_iterations", "solver_feasible",
+        "solver_x0_rmse", "solver_x0_nrmse", "solver_max_input_violation",
+        "solver_tracking_loss", "solver_dynamics_residual", "fallback_used",
+    )}
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0 if args.seed is None else args.seed)
 
     def u_caller(k: int, x: "np.ndarray") -> "np.ndarray":
         x = np.asarray(x, dtype=float).reshape(args.x_dim)
 
-        x_init = torch.zeros(args.H + 1, args.x_dim, device=device)
-        x_init[0] = torch.tensor(x, dtype=torch.float32, device=device)
-
-        if state["x_seq"] is not None:
-            x_prev = state["x_seq"]
-            x_init[:-1] = torch.tensor(x_prev[1:], dtype=torch.float32, device=device)
-            x_init[-1] = x_init[-2]
-
-        u_init = torch.tensor(state["u_seq"], dtype=torch.float32, device=device)
-        alpha_init = state["alpha"].detach().clone()
-
-        solver = BehaviorManifoldControlSolver(
-            decoder=decoder,
-            x_dim=args.x_dim,
-            u_dim=args.u_dim,
-            horizon=args.H,
-            Q=Q,
-            R=R,
-            x_ref=x_ref,
-            u_ref=u_ref,
-            lambda_theta=args.lambda_theta,
-            lambda_curvature=args.lambda_curvature,
-            lr=args.solve_lr,
-            max_iter=args.max_iter,
-            u_bounds=(-args.umax, args.umax),
-            curvature_mode="local",
-            device=device,
+        current = torch.tensor(x, dtype=torch.float32, device=device)
+        if state["previous_x_plan"] is None:
+            x_seed = x_ref.expand(args.H + 1, -1).clone()
+            x_seed[0] = current
+            u_seed = u_ref.expand(args.H, -1).clone()
+        else:
+            x_seed = state["previous_x_plan"].clone()
+            x_seed[:-1] = state["previous_x_plan"][1:]
+            x_seed[-1] = state["previous_x_plan"][-1]
+            x_seed[0] = current
+            u_seed = state["previous_u_plan"].clone()
+            u_seed[:-1] = state["previous_u_plan"][1:]
+            u_seed[-1] = state["previous_u_plan"][-1]
+        starts = []
+        if encoder is not None:
+            starts.append(solver.encode_initial_trajectory(x_seed, u_seed))
+        if state["previous_alpha"] is not None:
+            starts.append(state["previous_alpha"])
+        starts.append(torch.zeros(args.alpha_dim, device=device))
+        while len(starts) < args.control_multistart:
+            base = starts[0]
+            starts.append(base + 0.01 * torch.randn(base.shape, generator=generator, device=device))
+        sol = solver.solve_multistart(current, starts[:max(1, args.control_multistart)])
+        usable = (
+            sol.finite
+            and sol.x0_rmse <= 10.0 * args.control_constraint_tol
+            and sol.max_input_violation <= max(args.control_constraint_tol, 1e-6)
         )
-
-        sol = solver.solve(
-            x_init=x_init,
-            u_init=u_init,
-            alpha_init=alpha_init,
-            freeze={"theta": True, "x": False, "u": False, "alpha": False},
+        fallback_used = not usable
+        if usable:
+            control = sol.u[0].detach().cpu().numpy()
+            state["previous_x_plan"], state["previous_u_plan"] = sol.x, sol.u
+            state["previous_alpha"], state["previous_solution"] = sol.alpha, sol
+            if sol.feasible:
+                state["previous_feasible_u_plan"] = sol.u.detach().clone()
+        elif fallback_controller is not None:
+            control = np.asarray(fallback_controller(k, x), dtype=float)
+        elif state["previous_feasible_u_plan"] is not None:
+            control = state["previous_feasible_u_plan"][min(1, args.H - 1)].cpu().numpy()
+        else:
+            control = u_ref.detach().cpu().numpy()
+        values = (
+            sol.iterations, sol.outer_iterations, sol.feasible, sol.x0_rmse,
+            sol.x0_nrmse, sol.max_input_violation, sol.tracking_loss,
+            np.nan if sol.dynamics_residual_mean is None else sol.dynamics_residual_mean,
+            fallback_used,
         )
+        for key, value in zip(diagnostics, values):
+            diagnostics[key].append(value)
+        return np.clip(control, -args.umax, args.umax).reshape(args.u_dim)
 
-        u_opt = sol.u.detach().cpu().numpy()
-        x_opt = sol.x.detach().cpu().numpy()
-
-        state["u_seq"] = np.vstack([u_opt[1:], u_opt[-1:]])
-        state["x_seq"] = x_opt
-        state["alpha"] = sol.alpha.detach().clone()
-
-        return np.clip(u_opt[0], -args.umax, args.umax).reshape(args.u_dim)
-
+    u_caller.solver = solver
+    u_caller.state = state
+    u_caller.diagnostics = diagnostics
     return u_caller
 
 
@@ -289,6 +334,9 @@ def solve_single_step(
     x_ref: "torch.Tensor",
     u_ref: "torch.Tensor",
     x0: "np.ndarray",
+    encoder=None,
+    A=None,
+    B=None,
 ) -> None:
     """
     Solve one frozen-decoder manifold-control problem.
@@ -318,29 +366,22 @@ def solve_single_step(
     """
     import torch
 
-    from src.manifold_control import BehaviorManifoldControlSolver
+    from src.manifold_control import LatentBehaviorMPCSolver
 
     device = torch.device(args.device)
 
     for parameter in decoder.parameters():
         parameter.requires_grad_(False)
 
-    solver = BehaviorManifoldControlSolver(
-        decoder=decoder,
-        x_dim=args.x_dim,
-        u_dim=args.u_dim,
-        horizon=args.H,
-        Q=Q,
-        R=R,
-        x_ref=x_ref,
-        u_ref=u_ref,
-        lambda_theta=args.lambda_theta,
-        lambda_curvature=args.lambda_curvature,
-        lr=args.solve_lr,
-        max_iter=args.max_iter,
+    solver = LatentBehaviorMPCSolver(
+        decoder, args.x_dim, args.u_dim, args.H, Q, R, x_ref=x_ref, u_ref=u_ref,
         u_bounds=(-args.umax, args.umax),
-        curvature_mode="local",
-        device=device,
+        lambda_u_bounds=args.control_lambda_u_bounds,
+        rho_x0_init=args.control_rho_x0, rho_x0_growth=args.control_rho_growth,
+        rho_x0_max=args.control_rho_max, constraint_tol=args.control_constraint_tol,
+        encoder=encoder, A=A, B=B, lambda_dynamics=args.control_lambda_dynamics,
+        max_outer_iter=args.control_outer_max_iter,
+        inner_max_iter=args.control_inner_max_iter, lr=args.control_lr, device=device,
     )
 
     x_init = torch.zeros(args.H + 1, args.x_dim, device=device)
@@ -348,15 +389,21 @@ def solve_single_step(
     u_init = torch.zeros(args.H, args.u_dim, device=device)
     alpha_init = torch.zeros(args.alpha_dim, device=device)
 
-    solution = solver.solve(
-        x_init=x_init,
-        u_init=u_init,
-        alpha_init=alpha_init,
-        freeze={"theta": True, "x": False, "u": False, "alpha": False},
-    )
+    if encoder is not None:
+        x_init[1:] = x_ref
+        alpha_init = solver.encode_initial_trajectory(x_init, u_init)
+    solution = solver.solve(torch.as_tensor(x0, device=device), alpha_init=alpha_init)
 
     u_plan = solution.u.detach().cpu().numpy()
-    print(f"  loss_dict={solution.loss_dict}")
+    print(f"  tracking objective={solution.tracking_loss:.6g}")
+    print(f"  initial-state RMSE={solution.x0_rmse:.6g}")
+    print(f"  normalized initial-state mismatch={solution.x0_nrmse:.6g}")
+    print(f"  maximum input-bound violation={solution.max_input_violation:.6g}")
+    print(f"  mean normalized dynamics residual={solution.dynamics_residual_mean}")
+    print(f"  95th-percentile normalized dynamics residual={solution.dynamics_residual_p95}")
+    print(f"  inner iterations={solution.iterations}")
+    print(f"  outer iterations={solution.outer_iterations}")
+    print(f"  feasible={solution.feasible}")
     print(f"  first control={u_plan[0]}")
 
 
@@ -371,6 +418,7 @@ def run_simulation(
     u_ref_t: "torch.Tensor",
     x0: "np.ndarray",
     x_ref: "np.ndarray",
+    encoder=None,
 ) -> None:
     """
     Run closed-loop manifold control and LQR baseline simulations.
@@ -409,6 +457,11 @@ def run_simulation(
     """
     import numpy as np
 
+    u_lqr = finite_horizon_lqr_u_caller(
+        A, B, args.q_scale * np.eye(args.x_dim),
+        args.r_scale * np.eye(args.u_dim),
+        horizon=max(args.sim_steps, args.H), x_ref=x_ref, umax=args.umax,
+    )
     u_manifold = make_linear_manifold_u_caller_args(
         args=args,
         decoder=decoder,
@@ -416,6 +469,7 @@ def run_simulation(
         R=R,
         x_ref=x_ref_t,
         u_ref=u_ref_t,
+        encoder=encoder, A=A, B=B, fallback_controller=u_lqr,
     )
 
     X_mani, U_mani = simulate_discrete_closed_loop(
@@ -426,15 +480,6 @@ def run_simulation(
         num_steps=args.sim_steps,
     )
 
-    u_lqr = finite_horizon_lqr_u_caller(
-        A,
-        B,
-        args.q_scale * np.eye(args.x_dim),
-        args.r_scale * np.eye(args.u_dim),
-        horizon=max(args.sim_steps, args.H),
-        x_ref=x_ref,
-        umax=args.umax,
-    )
     X_lqr, U_lqr = simulate_discrete_closed_loop(
         A,
         B,
@@ -455,6 +500,12 @@ def run_simulation(
     print(f"  final ||x_manifold - x_ref||={np.linalg.norm(X_mani[:, -1] - x_ref):.6f}")
     print(f"  final ||x_lqr      - x_ref||={np.linalg.norm(X_lqr[:, -1] - x_ref):.6f}")
     print(f"  final ||x_zero     - x_ref||={np.linalg.norm(X_zero[:, -1] - x_ref):.6f}")
+    diagnostics = {key: np.asarray(value) for key, value in u_manifold.diagnostics.items()}
+    print(f"  feasible solves={100.0 * diagnostics['solver_feasible'].mean():.1f}%")
+    print(f"  median/max x0 RMSE={np.median(diagnostics['solver_x0_rmse']):.6g}/"
+          f"{np.max(diagnostics['solver_x0_rmse']):.6g}")
+    print(f"  median solve iterations={np.median(diagnostics['solver_iterations']):.1f}")
+    print(f"  maximum input violation={np.max(diagnostics['solver_max_input_violation']):.6g}")
 
     if args.results_path is not None:
         args.results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,6 +521,7 @@ def run_simulation(
             U_lqr=U_lqr,
             X_zero=X_zero,
             U_zero=U_zero,
+            **diagnostics,
         )
         print(f"  saved simulation results to {args.results_path}")
 
@@ -690,6 +742,7 @@ def main() -> None:
             x_ref=x_ref_t,
             u_ref=u_ref_t,
             x0=x0,
+            encoder=encoder, A=A, B=B,
         )
 
         if not args.skip_simulation:
@@ -704,6 +757,7 @@ def main() -> None:
                 u_ref_t=u_ref_t,
                 x0=x0,
                 x_ref=x_ref,
+                encoder=encoder,
             )
 
     print("Done.")
