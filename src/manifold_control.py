@@ -810,7 +810,45 @@ def quadratic_tracking_loss(
 
 @dataclass
 class LatentMPCSolution:
-    """Result of a latent-only behavior MPC solve."""
+    """Result of a latent-only behavior MPC solve.
+
+    Attributes
+    ----------
+    x : torch.Tensor
+        Decoded physical state sequence with shape ``(horizon + 1, x_dim)``.
+    u : torch.Tensor
+        Decoded physical input sequence with shape ``(horizon, u_dim)``.
+    alpha : torch.Tensor
+        Optimized latent coordinate with shape ``(alpha_dim,)``.
+    w_hat : torch.Tensor
+        Decoder output in the trajectory coordinates used during training.
+    loss : float
+        Final augmented objective value.
+    tracking_loss : float
+        Final physical-coordinate quadratic tracking objective.
+    x0_rmse : float
+        Root-mean-square initial-state constraint residual.
+    x0_nrmse : float
+        Normalized Euclidean initial-state mismatch.
+    max_input_violation : float
+        Maximum elementwise physical input-bound violation.
+    mean_input_violation : float
+        Mean elementwise physical input-bound violation.
+    dynamics_residual_mean : float or None
+        Mean normalized dynamics residual when ``A`` and ``B`` are available.
+    dynamics_residual_p95 : float or None
+        95th percentile normalized dynamics residual when available.
+    feasible : bool
+        Whether the final finite initial-state residual satisfies tolerance.
+    iterations : int
+        Total number of completed inner optimizer steps.
+    outer_iterations : int
+        Number of augmented-Lagrangian outer iterations completed.
+    history : list of dict
+        Per-iteration diagnostics, empty unless history storage was requested.
+    finite : bool
+        Whether the returned objective and latent coordinate are finite.
+    """
 
     x: TensorLike
     u: TensorLike
@@ -837,6 +875,80 @@ class LatentBehaviorMPCSolver:
     Decoding and all constraints are differentiable with respect to ``alpha``.
     Costs and residuals are evaluated in physical coordinates, after optional
     trajectory denormalization.
+
+    Parameters
+    ----------
+    decoder : torch.nn.Module
+        Trained trajectory decoder. Its parameters are frozen by the solver.
+    x_dim : int
+        Physical state dimension.
+    u_dim : int
+        Physical input dimension.
+    horizon : int
+        Number of control intervals in each decoded trajectory.
+    Q : torch.Tensor, optional
+        Stage state-cost matrix. Defaults to identity.
+    R : torch.Tensor, optional
+        Stage input-cost matrix. Defaults to identity.
+    encoder : torch.nn.Module, optional
+        Frozen trajectory encoder used only to construct latent warm starts.
+    x_ref : torch.Tensor, optional
+        Physical state reference. Defaults to zero.
+    u_ref : torch.Tensor, optional
+        Physical input reference. Defaults to zero.
+    Q_terminal : torch.Tensor, optional
+        Terminal state-cost matrix. Defaults to ``Q``.
+    u_bounds : tuple of tensor-like, optional
+        Scalar or per-input physical lower and upper bounds.
+    lambda_u_bounds : float, optional
+        Weight on squared decoded-input bound violations.
+    lambda_alpha : float, optional
+        Weight on latent-coordinate regularization.
+    alpha_mean, alpha_std : torch.Tensor, optional
+        Latent training statistics for standardized regularization.
+    A, B : torch.Tensor, optional
+        Linear physical dynamics matrices. Both must be supplied together.
+    lambda_dynamics : float, optional
+        Weight on the mean squared normalized dynamics residual.
+    w_mean, w_std : torch.Tensor, optional
+        Trajectory normalization statistics. Identity normalization is used
+        when these are omitted.
+    x_scale : float, optional
+        Minimum scale used in normalized initial-state mismatch.
+    rho_x0_init : float, optional
+        Initial augmented-Lagrangian penalty for the initial state.
+    rho_x0_growth : float, optional
+        Multiplicative penalty growth factor.
+    rho_x0_max : float, optional
+        Maximum initial-state penalty.
+    constraint_tol : float, optional
+        Feasibility tolerance on initial-state RMSE.
+    max_outer_iter : int, optional
+        Maximum augmented-Lagrangian outer iterations.
+    inner_max_iter : int, optional
+        Maximum Adam steps in each outer iteration.
+    lr : float, optional
+        Adam learning rate.
+    min_inner_iter : int, optional
+        Minimum total Adam steps before early stopping.
+    patience : int, optional
+        Consecutive non-improving steps allowed after feasibility.
+    relative_loss_tol : float, optional
+        Relative objective decrease required to reset patience.
+    max_grad_norm : float, optional
+        Maximum latent gradient norm.
+    use_lbfgs_polish : bool, optional
+        Whether to polish the best candidate with L-BFGS.
+    lbfgs_max_iter : int, optional
+        Maximum L-BFGS polishing iterations.
+    store_history : bool, optional
+        Whether to retain scalar inner-loop history.
+    device : torch.device, optional
+        Device used for optimization. Defaults to the decoder device.
+    dtype : torch.dtype, optional
+        Floating-point type used by solver-owned tensors.
+    eps : float, optional
+        Numerical floor for normalization denominators.
     """
 
     def __init__(
@@ -881,6 +993,14 @@ class LatentBehaviorMPCSolver:
         dtype: torch.dtype = torch.float32,
         eps: float = 1e-8,
     ) -> None:
+        """Initialize a frozen-decoder latent MPC solver.
+
+        Notes
+        -----
+        Parameter meanings, defaults, and coordinate conventions are
+        documented on :class:`LatentBehaviorMPCSolver`. Initialization freezes
+        the decoder and optional encoder immediately.
+        """
         if min(x_dim, u_dim, horizon, max_outer_iter) <= 0:
             raise ValueError("dimensions, horizon, and max_outer_iter must be positive.")
         self.decoder = decoder
@@ -943,31 +1063,116 @@ class LatentBehaviorMPCSolver:
         self.last_result: Optional[LatentMPCSolution] = None
 
     def _tensor(self, value: TensorLike, shape: Tuple[int, ...]) -> TensorLike:
+        """Convert and validate a solver tensor.
+
+        Parameters
+        ----------
+        value : torch.Tensor or array-like
+            Value to convert to the solver device and data type.
+        shape : tuple of int
+            Required output shape.
+
+        Returns
+        -------
+        torch.Tensor
+            Converted tensor.
+
+        Raises
+        ------
+        ValueError
+            If the converted tensor does not have ``shape``.
+        """
         result = torch.as_tensor(value, device=self.device, dtype=self.dtype)
         if tuple(result.shape) != shape:
             raise ValueError(f"Expected shape {shape}, got {tuple(result.shape)}.")
         return result
 
     def _optional(self, value: Optional[TensorLike]) -> Optional[TensorLike]:
+        """Convert an optional value to solver tensor coordinates.
+
+        Parameters
+        ----------
+        value : torch.Tensor or array-like or None
+            Optional value to convert.
+
+        Returns
+        -------
+        torch.Tensor or None
+            Converted tensor, or ``None`` when no value was supplied.
+        """
         return None if value is None else torch.as_tensor(value, device=self.device, dtype=self.dtype)
 
     def _normalizer(self, value: Optional[TensorLike], default: float) -> TensorLike:
+        """Create and validate a trajectory normalization vector.
+
+        Parameters
+        ----------
+        value : torch.Tensor or array-like or None
+            Explicit vector with shape ``(w_dim,)``.
+        default : float
+            Fill value used when ``value`` is omitted.
+
+        Returns
+        -------
+        torch.Tensor
+            Normalization vector with shape ``(w_dim,)``.
+        """
         result = torch.full((self.w_dim,), default, device=self.device, dtype=self.dtype)
         if value is not None:
             result = self._tensor(value, (self.w_dim,))
         return result
 
     def normalize_w(self, w: TensorLike) -> TensorLike:
-        """Convert a physical trajectory vector to decoder coordinates."""
+        """Convert physical trajectory vectors to training coordinates.
+
+        Parameters
+        ----------
+        w : torch.Tensor
+            Physical behavior vector with trailing dimension ``w_dim``.
+
+        Returns
+        -------
+        torch.Tensor
+            Normalized behavior vector with the same shape as ``w``.
+        """
         w = torch.as_tensor(w, device=self.device, dtype=self.dtype)
         return (w - self.w_mean) / torch.clamp(self.w_std, min=self.eps)
 
     def denormalize_w(self, w: TensorLike) -> TensorLike:
-        """Convert a decoder-coordinate trajectory vector to physical units."""
+        """Convert training-coordinate trajectory vectors to physical units.
+
+        Parameters
+        ----------
+        w : torch.Tensor
+            Normalized behavior vector with trailing dimension ``w_dim``.
+
+        Returns
+        -------
+        torch.Tensor
+            Physical behavior vector with the same shape as ``w``.
+        """
         return w * self.w_std + self.w_mean
 
     def encode_initial_trajectory(self, x_init: TensorLike, u_init: TensorLike) -> TensorLike:
-        """Encode a physical-unit initialization trajectory."""
+        """Encode a physical-unit initialization trajectory.
+
+        Parameters
+        ----------
+        x_init : torch.Tensor
+            State seed with shape ``(horizon + 1, x_dim)``.
+        u_init : torch.Tensor
+            Input seed with shape ``(horizon, u_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Detached latent warm start with shape ``(alpha_dim,)``.
+
+        Raises
+        ------
+        ValueError
+            If no encoder was supplied or either trajectory has wrong shape.
+        """
         if self.encoder is None:
             raise ValueError("An encoder is required for trajectory initialization.")
         x = self._tensor(x_init, (self.horizon + 1, self.x_dim))
@@ -976,6 +1181,22 @@ class LatentBehaviorMPCSolver:
             return self.encoder(self.normalize_w(build_w(x, u))).reshape(-1).detach()
 
     def _decode(self, alpha: TensorLike) -> Tuple[TensorLike, TensorLike, TensorLike]:
+        """Decode a latent coordinate and unpack its physical trajectory.
+
+        Parameters
+        ----------
+        alpha : torch.Tensor
+            Latent coordinate with shape ``(alpha_dim,)``.
+
+        Returns
+        -------
+        w_hat : torch.Tensor
+            Decoder output in training trajectory coordinates.
+        x_seq : torch.Tensor
+            Physical state sequence.
+        u_seq : torch.Tensor
+            Physical input sequence.
+        """
         w_hat = self.decoder(alpha).reshape(-1)
         w_physical = self.denormalize_w(w_hat)
         x, u = unpack_w(
@@ -986,6 +1207,27 @@ class LatentBehaviorMPCSolver:
     def _components(
         self, alpha: TensorLike, x_current: TensorLike, multiplier: TensorLike, rho: float
     ) -> Tuple[TensorLike, Dict[str, TensorLike]]:
+        """Evaluate the differentiable latent MPC objective and components.
+
+        Parameters
+        ----------
+        alpha : torch.Tensor
+            Current latent optimization variable.
+        x_current : torch.Tensor
+            Measured physical state with shape ``(x_dim,)``.
+        multiplier : torch.Tensor
+            Initial-state Lagrange multiplier with shape ``(x_dim,)``.
+        rho : float
+            Current augmented-Lagrangian penalty.
+
+        Returns
+        -------
+        total : torch.Tensor
+            Scalar augmented objective.
+        components : dict
+            Tensor-valued decoded trajectories, losses, violations, and
+            residual diagnostics.
+        """
         w_hat, x, u = self._decode(alpha)
         stage = quadratic_tracking_loss(
             x[:-1], u, self.Q, self.R, self.x_ref, self.u_ref
@@ -1037,6 +1279,30 @@ class LatentBehaviorMPCSolver:
         rho: float, iterations: int, outer_iterations: int,
         history: List[Dict[str, float]],
     ) -> LatentMPCSolution:
+        """Recompute and package diagnostics for a candidate latent point.
+
+        Parameters
+        ----------
+        alpha : torch.Tensor
+            Candidate latent coordinate.
+        x_current : torch.Tensor
+            Measured physical initial state.
+        multiplier : torch.Tensor
+            Current initial-state Lagrange multiplier.
+        rho : float
+            Current augmented-Lagrangian penalty.
+        iterations : int
+            Completed inner optimizer steps.
+        outer_iterations : int
+            Completed augmented-Lagrangian iterations.
+        history : list of dict
+            Stored scalar iteration history.
+
+        Returns
+        -------
+        LatentMPCSolution
+            Detached candidate and freshly recomputed diagnostics.
+        """
         with torch.no_grad():
             loss, c = self._components(alpha, x_current, multiplier, rho)
             residual = c["initial_residual"]
@@ -1063,7 +1329,20 @@ class LatentBehaviorMPCSolver:
 
     @staticmethod
     def is_better(candidate: LatentMPCSolution, incumbent: Optional[LatentMPCSolution]) -> bool:
-        """Apply feasibility-first candidate ordering."""
+        """Compare candidates using feasibility-first ordering.
+
+        Parameters
+        ----------
+        candidate : LatentMPCSolution
+            Candidate being considered.
+        incumbent : LatentMPCSolution or None
+            Current best solution.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``candidate`` should replace ``incumbent``.
+        """
         if incumbent is None:
             return candidate.finite
         if candidate.feasible != incumbent.feasible:
@@ -1080,7 +1359,25 @@ class LatentBehaviorMPCSolver:
         x_init: Optional[TensorLike] = None,
         u_init: Optional[TensorLike] = None,
     ) -> LatentMPCSolution:
-        """Solve the latent MPC problem for a measured initial state."""
+        """Solve the latent MPC problem for a measured initial state.
+
+        Parameters
+        ----------
+        x_current : torch.Tensor
+            Measured physical state with shape ``(x_dim,)``.
+        alpha_init : torch.Tensor, optional
+            Explicit latent initialization. It takes precedence over encoder
+            initialization.
+        x_init : torch.Tensor, optional
+            Physical state seed used with ``u_init`` and the encoder.
+        u_init : torch.Tensor, optional
+            Physical input seed used with ``x_init`` and the encoder.
+
+        Returns
+        -------
+        LatentMPCSolution
+            Best candidate found using feasibility-first selection.
+        """
         current = self._tensor(x_current, (self.x_dim,))
         if alpha_init is None and x_init is not None and u_init is not None and self.encoder is not None:
             alpha_init = self.encode_initial_trajectory(x_init, u_init)
@@ -1136,6 +1433,13 @@ class LatentBehaviorMPCSolver:
             alpha = nn.Parameter(best.alpha.clone())
             optimizer = torch.optim.LBFGS([alpha], max_iter=self.lbfgs_max_iter)
             def closure() -> TensorLike:
+                """Evaluate and differentiate the L-BFGS polishing objective.
+
+                Returns
+                -------
+                torch.Tensor
+                    Scalar latent MPC objective at the current L-BFGS point.
+                """
                 optimizer.zero_grad(set_to_none=True)
                 value, _ = self._components(alpha, current, multiplier, rho)
                 value.backward()
@@ -1160,7 +1464,21 @@ class LatentBehaviorMPCSolver:
     def solve_multistart(
         self, x_current: TensorLike, alpha_initializations: Sequence[TensorLike]
     ) -> LatentMPCSolution:
-        """Solve sequential latent starts and return the feasibility-first best."""
+        """Solve multiple latent starts sequentially.
+
+        Parameters
+        ----------
+        x_current : torch.Tensor
+            Measured physical state with shape ``(x_dim,)``.
+        alpha_initializations : sequence of torch.Tensor
+            Candidate latent initializations.
+
+        Returns
+        -------
+        LatentMPCSolution
+            Feasibility-first best solution across all starts. An empty
+            sequence triggers the solver's zero initialization.
+        """
         best = None
         for initial in alpha_initializations:
             candidate = self.solve(x_current, alpha_init=initial)

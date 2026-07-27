@@ -228,10 +228,24 @@ def make_linear_manifold_u_caller_args(
     u_ref : torch.Tensor
         Reference input.
 
+    encoder : BehaviorEncoder, optional
+        Trained encoder used for shifted-trajectory latent warm starts.
+
+    A : array-like, optional
+        Linear state-transition matrix used for dynamics diagnostics.
+
+    B : array-like, optional
+        Linear input matrix used for dynamics diagnostics.
+
+    fallback_controller : callable, optional
+        Controller called when the latent solution is unusable.
+
     Returns
     -------
     callable
-        Controller called as ``u_caller(k, x_k)``.
+        Controller called as ``u_caller(k, x_k)``. The returned callable
+        exposes its persistent ``solver``, warm-start ``state``, and collected
+        ``diagnostics`` as attributes.
     """
     import numpy as np
 
@@ -267,6 +281,20 @@ def make_linear_manifold_u_caller_args(
     generator.manual_seed(0 if args.seed is None else args.seed)
 
     def u_caller(k: int, x: "np.ndarray") -> "np.ndarray":
+        """Compute one receding-horizon control input.
+
+        Parameters
+        ----------
+        k : int
+            Closed-loop time index.
+        x : numpy.ndarray
+            Current physical state with shape ``(x_dim,)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Bounded control input with shape ``(u_dim,)``.
+        """
         x = np.asarray(x, dtype=float).reshape(args.x_dim)
 
         current = torch.tensor(x, dtype=torch.float32, device=device)
@@ -363,6 +391,20 @@ def solve_single_step(
 
     x0 : np.ndarray, shape (x_dim,)
         Initial state.
+
+    encoder : BehaviorEncoder, optional
+        Trained encoder used to initialize the latent coordinate.
+
+    A : array-like, optional
+        Linear state-transition matrix used for dynamics diagnostics.
+
+    B : array-like, optional
+        Linear input matrix used for dynamics diagnostics.
+
+    Returns
+    -------
+    None
+        Solver diagnostics and the first control input are printed.
     """
     import torch
 
@@ -454,6 +496,14 @@ def run_simulation(
 
     x_ref : np.ndarray, shape (x_dim,)
         Reference state.
+
+    encoder : BehaviorEncoder, optional
+        Trained encoder used for closed-loop shifted-plan warm starts.
+
+    Returns
+    -------
+    None
+        Simulation summaries are printed and optionally saved or plotted.
     """
     import numpy as np
 

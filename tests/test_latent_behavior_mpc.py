@@ -11,6 +11,7 @@ from src.manifold_control import (
 
 
 def test_unpack_w_inverts_build_w_and_supports_batches():
+    """Verify exact single-trajectory inversion and batched output shapes."""
     x = torch.randn(5, 3)
     u = torch.randn(4, 2)
     x_out, u_out = unpack_w(build_w(x, u), x_dim=3, u_dim=2, horizon=4)
@@ -21,6 +22,7 @@ def test_unpack_w_inverts_build_w_and_supports_batches():
 
 
 def test_solver_freezes_decoder_and_decoded_plan_is_exact():
+    """Verify decoder freezing and direct decoded-plan construction."""
     decoder = BehaviorDecoder(2, 7, hidden_dims=(4,))
     solver = LatentBehaviorMPCSolver(
         decoder, x_dim=1, u_dim=1, horizon=3, inner_max_iter=2, max_outer_iter=1
@@ -34,6 +36,7 @@ def test_solver_freezes_decoder_and_decoded_plan_is_exact():
 
 
 def test_encoder_warm_start_shape_and_physical_denormalization():
+    """Verify encoder initialization and physical trajectory denormalization."""
     decoder = BehaviorDecoder(2, 5, hidden_dims=())
     encoder = BehaviorEncoder(5, 2, hidden_dims=())
     mean = torch.arange(5, dtype=torch.float32)
@@ -51,15 +54,29 @@ def test_encoder_warm_start_shape_and_physical_denormalization():
 
 
 class LinearTrajectoryDecoder(nn.Module):
+    """Simple decoder whose trajectories satisfy scalar identity dynamics."""
     alpha_dim = 1
     w_dim = 5
 
     def forward(self, alpha):
+        """Decode a scalar latent coordinate.
+
+        Parameters
+        ----------
+        alpha : torch.Tensor
+            Scalar latent coordinate with shape ``(1,)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Flattened state and input trajectory with shape ``(5,)``.
+        """
         # x = [a, a, a], u = [0, 0], so x_{k+1}=x_k exactly.
         return torch.stack((alpha[0], alpha[0], alpha[0], alpha[0] * 0, alpha[0] * 0))
 
 
 def test_augmented_constraint_and_linear_dynamics_residual():
+    """Verify initial-state enforcement and exact dynamics diagnostics."""
     solver = LatentBehaviorMPCSolver(
         LinearTrajectoryDecoder(), 1, 1, 2, A=torch.ones(1, 1), B=torch.zeros(1, 1),
         rho_x0_init=10.0, inner_max_iter=100, max_outer_iter=3, lr=0.1,
@@ -71,6 +88,7 @@ def test_augmented_constraint_and_linear_dynamics_residual():
 
 
 def test_input_bound_violation_diagnostics():
+    """Verify zero violation diagnostics for inputs inside their bounds."""
     decoder = LinearTrajectoryDecoder()
     solver = LatentBehaviorMPCSolver(
         decoder, 1, 1, 2, u_bounds=(-0.1, 0.1), inner_max_iter=0, max_outer_iter=1
