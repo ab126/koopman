@@ -103,6 +103,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+
 def solve_single_step(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None:
     import torch
 
@@ -149,7 +150,6 @@ def solve_single_step(args: argparse.Namespace, decoder: "BehaviorDecoder") -> N
     u_plan = solution.u.detach().cpu().numpy()
     print(f"  loss_dict={solution.loss_dict}")
     print(f"  first control={u_plan[0, 0]:.6f}")
-
 
 
 def run_simulation(args: argparse.Namespace, decoder: "BehaviorDecoder") -> None:
