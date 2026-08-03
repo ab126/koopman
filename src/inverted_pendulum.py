@@ -168,31 +168,25 @@ def simulate_u_rk4(u_caller, M, y0=None, t_span=(0, 10), num_points=500, verbose
     X[:, 0] = y0
     t_vals[0] = t0
 
-    def f(t, y):
-        return dynamics_open_loop(y, u_caller(t, y), M)
-
     y = y0.copy()
     t = t0
 
     loop_iter = tqdm(range(num_points), desc="RK4 Integration") if verbose else range(num_points)
     for k in loop_iter:
         # control evaluated ONCE per step
-        u = u_caller(t, y)
+        u = float(u_caller(t, y))
         U[k] = u
 
-        k1 = f(t, y)
-        k2 = f(t + dt/2, y + dt/2 * k1)
-        k3 = f(t + dt/2, y + dt/2 * k2)
-        k4 = f(t + dt, y + dt * k3)
+        k1 = dynamics_open_loop(y, u, M)
+        k2 = dynamics_open_loop(y + 0.5 * dt * k1, u, M)
+        k3 = dynamics_open_loop(y + 0.5 * dt * k2, u, M)
+        k4 = dynamics_open_loop(y + dt * k3, u, M)
 
         y = y + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         t = t + dt
 
         X[:, k+1] = y
         t_vals[k+1] = t
-
-    X = X[:, 1:] # Drop initial state to match dimensions with U
-    t_vals = t_vals[1:]
 
     return t_vals, X[0], X[1], X[2], X[3], U
 
@@ -433,11 +427,26 @@ def identify_sys(x, x_dot, theta, theta_dot, F, m=1., g=1., l=1., t=None, model_
     u = F / (mg)  # Assuming normalized input
     return identify_sys_u(x, x_dot, theta, theta_dot, u, t=t/t0, model_type=model_type, lift=lift)
 
-def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), num_points=500, n_repeats=10, verbose=True, method='rk4'):
-    """Generates state/input trajectories up to a maximum theta and then repeats."""
+def gen_max_theta_data(
+    M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10),
+    num_points=500, n_repeats=10, verbose=True, method='rk4', umax=2.0,
+    control_dt=None, seed=None,
+):
+    """Generate fixed-step physical trajectories with bounded normalized inputs.
+
+    ``umax`` is the bound on normalized input ``u = F / (m g)``. The
+    corresponding physical force bound is ``umax * m * g``.
+    """
 
     t0, state_scale, mg = _physical_state_scale(m, g, l)
-    t_lin = np.linspace(*t_span, num_points)
+    if method != "rk4":
+        raise ValueError("gen_max_theta_data supports RK4 only")
+    duration = float(t_span[1] - t_span[0])
+    if control_dt is None:
+        control_dt = duration / num_points
+    num_points = round(duration / control_dt)
+    t_lin = t_span[0] + np.arange(num_points) * control_dt
+    rng = np.random.default_rng(seed)
     t_all = []
     X_all = []
     F_all = []
@@ -448,23 +457,27 @@ def gen_max_theta_data(M, m, g, l, sigma=0.5, theta_max=0.15, t_span=(0, 10), nu
 
     loop_iter = tqdm(range(n_repeats), desc="Trajectory Generation") if verbose else range(n_repeats)
     for _ in loop_iter:
-        all_F = gauss_process(t_lin, sigma=sigma*mg)
+        u_samples = np.clip(rng.normal(scale=sigma, size=num_points), -umax, umax)
+        all_F = u_samples * mg
 
         def gauss_F(t_val, y):
-            def closest_index(arr, val):
-                return min(range(len(arr)), key=lambda i: abs(arr[i] - val))    
-            return all_F[closest_index(t_lin, t_val)]
+            index = min(max(int((t_val - t_span[0]) / control_dt), 0), num_points - 1)
+            return all_F[index]
         
-        x0 = [0.0, 0.0, np.random.uniform(-theta_max*0.6, theta_max*0.6), 0.0] # Random initial theta within 60% of max
+        x0_normalized = np.array([
+            rng.uniform(-0.25, 0.25), rng.uniform(-0.25, 0.25),
+            rng.uniform(-0.20, 0.20), rng.uniform(-0.50, 0.50),
+        ])
+        x0 = x0_normalized * state_scale
 
         t, x, x_dot, theta, theta_dot, F = simulate(gauss_F, M, m, g, l, y0=x0, t_span=t_span, num_points=num_points, method=method, verbose=False)
         ind = first_greater(np.abs(theta), theta_max)
         if ind > 0:
-            t = t[:ind]
-            x = x[:ind]
-            x_dot = x_dot[:ind]
-            theta = theta[:ind]
-            theta_dot = theta_dot[:ind]
+            t = t[:ind + 1]
+            x = x[:ind + 1]
+            x_dot = x_dot[:ind + 1]
+            theta = theta[:ind + 1]
+            theta_dot = theta_dot[:ind + 1]
             F = F[:ind]
         
         t_all.append(t)
@@ -494,9 +507,10 @@ def build_inv_pend_training_matrix(
     for X, F in zip(X_all, F_all):
         Xn = X / state_scale.reshape(4, 1)
         un = F / mg
-        horizon_count = Xn.shape[1] - H - 1
+        num_steps = np.asarray(F).size
+        n_windows = num_steps - H + 1
 
-        for k in range(max(0, horizon_count)):
+        for k in range(max(0, n_windows)):
             x_seq = Xn[:, k : k + H + 1].T
             u_seq = un[k : k + H].reshape(H, 1)
             rows.append(np.concatenate([x_seq.reshape(-1), u_seq.reshape(-1)]))
@@ -521,12 +535,18 @@ def identify_sys_multiple_trajectories_u(t_all, X_all, u_all, model_type="contin
         Z = np.array([lift(X[:, i]) for i in range(X.shape[1])]).T
 
         if model_type == "continuous":
+            u = np.asarray(u, dtype=float).reshape(-1)
+            if u.size == Z.shape[1] - 1:
+                Z = Z[:, :-1]
+                t = np.asarray(t)[:-1]
+            elif u.size != Z.shape[1]:
+                raise ValueError("u must have either the same number of samples as X or one fewer sample.")
             try:
                 dZdt_blocks.append(finite_difference(Z, t))
             except ValueError as e:
                 continue  # Skip this trajectory if it doesn't have the right number of samples
             Z_blocks.append(Z)
-            Uk_blocks.append(np.asarray(u, dtype=float).reshape(1, -1))
+            Uk_blocks.append(u.reshape(1, -1))
         elif model_type == "discrete":
             u = np.asarray(u, dtype=float).reshape(-1)
             if u.size == Z.shape[1]:

@@ -1594,7 +1594,7 @@ def _detach_loss_dict(loss_dict: Mapping[str, TensorLike]) -> Dict[str, float]:
     }
 
 
-# Inverted Pendulum Callers
+# Inverted Pendulum Callers # TODO: Move them out, this is for core functions only
 
 def manifold_u_caller(
     decoder,
@@ -1720,6 +1720,9 @@ def manifold_F_caller(
 ):
     """
     Returns F_caller(t, y_phys), matching the physical-unit interface expected by simulate().
+
+    ``umax`` is the bound on normalized input ``u = F / (m g)``. The
+    corresponding physical force bound is ``umax * m * g``.
     """
 
     u_caller = manifold_u_caller(
@@ -1730,8 +1733,8 @@ def manifold_F_caller(
         x_ref=None if x_ref is None else np.asarray(x_ref) / np.array(
             [l, l / np.sqrt(l / g), 1.0, 1.0 / np.sqrt(l / g)]
         ),
-        u_ref=np.array([u_ref / (m * g)]),
-        umax=umax / (m * g),
+        u_ref=np.array([u_ref]),
+        umax=umax,
         **kwargs,
     )
 
