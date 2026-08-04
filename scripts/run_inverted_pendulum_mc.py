@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from tqdm import tqdm
+
 from src.inverted_pendulum import (
     _physical_state_scale,
     gen_max_theta_data,
@@ -102,7 +104,7 @@ def simulate_discrete_inverted_pendulum(u_caller, M_ratio, y0, dt, num_steps, um
     X = np.empty((4, num_steps + 1), dtype=float)
     U = np.empty((1, num_steps), dtype=float)
     X[:, 0] = y
-    for k in range(num_steps):
+    for k in tqdm(range(num_steps), desc="Simulating"):
         u = float(np.asarray(u_caller(k, y)).reshape(-1)[0])
         u = float(np.clip(u, -umax, umax))
         U[0, k] = u
