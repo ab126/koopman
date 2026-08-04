@@ -1,0 +1,37 @@
+nohup: ignoring input
+Step 1/4: generating RK4 trajectory data
+Trajectory Generation:   0%|          | 0/100 [00:00<?, ?it/s]Trajectory Generation:   3%|▎         | 3/100 [00:00<00:03, 28.96it/s]Trajectory Generation:   6%|▌         | 6/100 [00:00<00:03, 29.09it/s]Trajectory Generation:  10%|█         | 10/100 [00:00<00:02, 30.46it/s]Trajectory Generation:  15%|█▌        | 15/100 [00:00<00:02, 34.98it/s]Trajectory Generation:  19%|█▉        | 19/100 [00:00<00:02, 35.84it/s]Trajectory Generation:  24%|██▍       | 24/100 [00:00<00:01, 38.24it/s]Trajectory Generation:  28%|██▊       | 28/100 [00:00<00:01, 37.53it/s]Trajectory Generation:  32%|███▏      | 32/100 [00:00<00:01, 38.21it/s]Trajectory Generation:  36%|███▌      | 36/100 [00:00<00:01, 38.22it/s]Trajectory Generation:  40%|████      | 40/100 [00:01<00:01, 37.76it/s]Trajectory Generation:  44%|████▍     | 44/100 [00:01<00:01, 36.82it/s]Trajectory Generation:  48%|████▊     | 48/100 [00:01<00:01, 36.94it/s]Trajectory Generation:  53%|█████▎    | 53/100 [00:01<00:01, 38.52it/s]Trajectory Generation:  57%|█████▋    | 57/100 [00:01<00:01, 37.09it/s]Trajectory Generation:  62%|██████▏   | 62/100 [00:01<00:00, 38.79it/s]Trajectory Generation:  66%|██████▌   | 66/100 [00:01<00:00, 38.42it/s]Trajectory Generation:  71%|███████   | 71/100 [00:01<00:00, 39.19it/s]Trajectory Generation:  75%|███████▌  | 75/100 [00:02<00:00, 38.07it/s]Trajectory Generation:  79%|███████▉  | 79/100 [00:02<00:00, 37.33it/s]Trajectory Generation:  83%|████████▎ | 83/100 [00:02<00:00, 37.18it/s]Trajectory Generation:  87%|████████▋ | 87/100 [00:02<00:00, 37.11it/s]Trajectory Generation:  91%|█████████ | 91/100 [00:02<00:00, 36.96it/s]Trajectory Generation:  95%|█████████▌| 95/100 [00:02<00:00, 36.42it/s]Trajectory Generation:  99%|█████████▉| 99/100 [00:02<00:00, 37.26it/s]Trajectory Generation: 100%|██████████| 100/100 [00:02<00:00, 36.99it/s]
+  behavior matrix shape=(6158, 129); train=4926, test=1232
+Step 2/4: training behavior autoencoder
+Training W=(4926, 129), method=minibatch, alpha_dim=29, device=cuda
+epoch=0000, loss=11.204458, fit=11.204454
+epoch=0250, loss=0.214903, fit=0.214896
+epoch=0500, loss=0.158034, fit=0.158028
+epoch=0750, loss=0.120700, fit=0.120695
+saved autoencoder checkpoint to saves/saved_models/behavior_decoder_inverse_pendulum.pt
+Train reconstruction: aggregate NRMSE=0.0830175, trajectory median=0.11414, trajectory p95=0.442961, R^2=0.993069
+  original data dynamics residual: mean=1.542e-08, median=1.42836e-08, p95=3.14387e-08, max=5.05146e-08
+  reconstructed dynamics residual: mean=0.00569345, median=0.00296433, p95=0.018664, max=0.270861
+Test reconstruction: aggregate NRMSE=0.0868746, trajectory median=0.115865, trajectory p95=0.48708, R^2=0.992412
+  original data dynamics residual: mean=1.54828e-08, median=1.43062e-08, p95=3.16228e-08, max=5.05146e-08
+  reconstructed dynamics residual: mean=0.00583342, median=0.00300782, p95=0.0195462, max=0.314932
+Step 3/4: solving normalized one-step latent MPC
+  tracking objective=3.59978
+  initial-state RMSE=0.0314867
+  normalized initial-state mismatch=0.0629734
+  maximum input-bound violation=0
+  inner/outer iterations=1500/5
+  feasible=False; first normalized control=[-0.31590906]
+Step 4/4: running normalized closed-loop comparison
+  final normalized state error (manifold)=0.700563
+  final normalized state error (lqr)=0.00251349
+  final normalized state error (zero)=1.03337
+  feasible solve percentage=0.4%
+  fallback fraction=0.54
+  median/max x0 RMSE=0.0205388/0.0508592
+  median solver iterations=1500.0
+  maximum normalized input violation=0.0266294
+  maximum absolute normalized input=2
+  implied maximum physical force=19.62
+  saved simulation results to saves/simulation_results/inverted_pendulum_results.npz
+Done.
