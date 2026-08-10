@@ -58,7 +58,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--H", type=int, default=25, help="control horizon")
     parser.add_argument("--control-dt", type=float, default=0.02, help="physical controller interval")
     parser.add_argument("--sim-duration", type=float, default=5.0, help="physical simulation duration")
-    parser.add_argument("--n-repeats", type=int, default=100)
+    parser.add_argument("--n-repeats", type=int, default=10000, help="number of random mat_theta trajectories to generate")
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--theta-max", type=float, default=math.pi / 20.0)
     parser.add_argument("--alpha-dim", type=int, default=29)
