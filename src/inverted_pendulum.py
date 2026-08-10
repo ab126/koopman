@@ -466,7 +466,7 @@ def gen_max_theta_data(
         
         x0_normalized = np.array([
             rng.uniform(-0.25, 0.25), rng.uniform(-0.25, 0.25),
-            rng.uniform(-0.20, 0.20), rng.uniform(-0.50, 0.50),
+            rng.uniform(-0.6 * theta_max, 0.6 * theta_max), rng.uniform(-0.50, 0.50),
         ])
         x0 = x0_normalized * state_scale
 

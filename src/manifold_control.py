@@ -810,7 +810,12 @@ def quadratic_tracking_loss(
 
 @dataclass
 class LatentMPCSolution:
-    """Result of a latent-only behavior MPC solve.
+    """Detached trajectory and diagnostics from a latent-only MPC solve.
+
+    The state and input plans are not independent decision variables: they are
+    the physical-coordinate trajectory obtained by decoding ``alpha``.  The
+    feasibility fields summarize the equality constraint ``x[0] = x_current``;
+    input and dynamics diagnostics do not by themselves set ``feasible``.
 
     Attributes
     ----------
@@ -823,13 +828,15 @@ class LatentMPCSolution:
     w_hat : torch.Tensor
         Decoder output in the trajectory coordinates used during training.
     loss : float
-        Final augmented objective value.
+        Final objective, including tracking, augmented initial-state,
+        input-bound, latent, and optional dynamics terms.
     tracking_loss : float
         Final physical-coordinate quadratic tracking objective.
     x0_rmse : float
         Root-mean-square initial-state constraint residual.
     x0_nrmse : float
-        Normalized Euclidean initial-state mismatch.
+        Euclidean initial-state mismatch divided by the larger of the measured
+        state norm, configured ``x_scale``, and numerical epsilon.
     max_input_violation : float
         Maximum elementwise physical input-bound violation.
     mean_input_violation : float
@@ -872,9 +879,18 @@ class LatentMPCSolution:
 class LatentBehaviorMPCSolver:
     """Optimize only the latent coordinate of a frozen behavior decoder.
 
-    Decoding and all constraints are differentiable with respect to ``alpha``.
-    Costs and residuals are evaluated in physical coordinates, after optional
-    trajectory denormalization.
+    Only ``alpha`` is optimized. The frozen decoder maps it to a complete state
+    and input trajectory, so decoded states and inputs are never adjusted
+    independently. Costs, constraints, bounds, and dynamics diagnostics are
+    evaluated in physical coordinates after optional denormalization.
+
+    The measured-state equality ``x_seq[0] = x_current`` is enforced with an
+    augmented Lagrangian. For residual ``r = x_seq[0] - x_current``, the inner
+    objective contains ``multiplier @ r + 0.5 * rho * ||r||^2``. After each
+    outer iteration the multiplier is updated by ``multiplier += rho * r``.
+    ``rho`` is therefore an adaptive constraint-penalty coefficient: it is
+    increased when successive outer iterations do not reduce the mismatch
+    sufficiently, rather than being a fixed tracking weight.
 
     Parameters
     ----------
@@ -901,30 +917,35 @@ class LatentBehaviorMPCSolver:
     u_bounds : tuple of tensor-like, optional
         Scalar or per-input physical lower and upper bounds.
     lambda_u_bounds : float, optional
-        Weight on squared decoded-input bound violations.
+        Weight on the mean squared amount by which decoded physical inputs
+        exceed ``u_bounds``. Bounds are not imposed by clamping during solve.
     lambda_alpha : float, optional
-        Weight on latent-coordinate regularization.
+        Weight on mean squared latent magnitude, or standardized magnitude
+        when both latent statistics are supplied.
     alpha_mean, alpha_std : torch.Tensor, optional
         Latent training statistics for standardized regularization.
     A, B : torch.Tensor, optional
         Linear physical dynamics matrices. Both must be supplied together.
     lambda_dynamics : float, optional
-        Weight on the mean squared normalized dynamics residual.
+        Weight on mean squared normalized one-step dynamics residual. Setting
+        it to zero keeps dynamics diagnostic-only.
     w_mean, w_std : torch.Tensor, optional
         Trajectory normalization statistics. Identity normalization is used
         when these are omitted.
     x_scale : float, optional
         Minimum scale used in normalized initial-state mismatch.
     rho_x0_init : float, optional
-        Initial augmented-Lagrangian penalty for the initial state.
+        Initial ``rho`` multiplying half the squared initial-state residual.
+        Larger values emphasize measured-state consistency in each inner solve.
     rho_x0_growth : float, optional
-        Multiplicative penalty growth factor.
+        Factor applied to ``rho`` when the initial-state RMSE fails to decrease
+        to at most 75 percent of its previous outer-iteration value.
     rho_x0_max : float, optional
-        Maximum initial-state penalty.
+        Upper bound on adaptive ``rho`` growth.
     constraint_tol : float, optional
         Feasibility tolerance on initial-state RMSE.
     max_outer_iter : int, optional
-        Maximum augmented-Lagrangian outer iterations.
+        Maximum multiplier updates and possible ``rho`` increases.
     inner_max_iter : int, optional
         Maximum Adam steps in each outer iteration.
     lr : float, optional
@@ -932,7 +953,8 @@ class LatentBehaviorMPCSolver:
     min_inner_iter : int, optional
         Minimum total Adam steps before early stopping.
     patience : int, optional
-        Consecutive non-improving steps allowed after feasibility.
+        Consecutive inner steps without sufficient objective improvement
+        allowed once the initial-state constraint is feasible.
     relative_loss_tol : float, optional
         Relative objective decrease required to reset patience.
     max_grad_norm : float, optional
@@ -997,9 +1019,10 @@ class LatentBehaviorMPCSolver:
 
         Notes
         -----
-        Parameter meanings, defaults, and coordinate conventions are
-        documented on :class:`LatentBehaviorMPCSolver`. Initialization freezes
-        the decoder and optional encoder immediately.
+        The decoder and optional encoder are switched to evaluation mode and
+        frozen immediately. They remain differentiable with respect to their
+        inputs, which is required to optimize ``alpha``. Parameter meanings and
+        coordinate conventions are documented on the class.
         """
         if min(x_dim, u_dim, horizon, max_outer_iter) <= 0:
             raise ValueError("dimensions, horizon, and max_outer_iter must be positive.")
@@ -1216,9 +1239,13 @@ class LatentBehaviorMPCSolver:
         x_current : torch.Tensor
             Measured physical state with shape ``(x_dim,)``.
         multiplier : torch.Tensor
-            Initial-state Lagrange multiplier with shape ``(x_dim,)``.
+            Dual variable for ``x[0] = x_current`` with shape ``(x_dim,)``.
+            Its dot product with the residual supplies the linear constraint
+            term in the augmented objective.
         rho : float
-            Current augmented-Lagrangian penalty.
+            Current positive coefficient of ``0.5 * ||x[0]-x_current||^2``.
+            It strengthens equality enforcement when multiplier updates alone
+            are not reducing the residual sufficiently.
 
         Returns
         -------
@@ -1290,7 +1317,8 @@ class LatentBehaviorMPCSolver:
         multiplier : torch.Tensor
             Current initial-state Lagrange multiplier.
         rho : float
-            Current augmented-Lagrangian penalty.
+            Constraint-penalty coefficient used to recompute the candidate's
+            augmented objective; it does not alter reported tracking loss.
         iterations : int
             Completed inner optimizer steps.
         outer_iterations : int
@@ -1361,6 +1389,12 @@ class LatentBehaviorMPCSolver:
     ) -> LatentMPCSolution:
         """Solve the latent MPC problem for a measured initial state.
 
+        Adam minimizes the current augmented objective in each inner loop.
+        Each outer loop then updates the equality-constraint multiplier and,
+        when progress is inadequate, increases ``rho``. The method stops after
+        reaching initial-state feasibility or exhausting ``max_outer_iter``.
+        Optional L-BFGS polishing starts from the best retained candidate.
+
         Parameters
         ----------
         x_current : torch.Tensor
@@ -1377,6 +1411,12 @@ class LatentBehaviorMPCSolver:
         -------
         LatentMPCSolution
             Best candidate found using feasibility-first selection.
+
+        Notes
+        -----
+        An explicit ``alpha_init`` has highest priority. Otherwise, paired
+        ``x_init`` and ``u_init`` are normalized and encoded when an encoder is
+        available; if neither path is available, initialization is zero.
         """
         current = self._tensor(x_current, (self.x_dim,))
         if alpha_init is None and x_init is not None and u_init is not None and self.encoder is not None:
@@ -1465,6 +1505,10 @@ class LatentBehaviorMPCSolver:
         self, x_current: TensorLike, alpha_initializations: Sequence[TensorLike]
     ) -> LatentMPCSolution:
         """Solve multiple latent starts sequentially.
+
+        Each start runs a complete augmented-Lagrangian solve. Feasible finite
+        solutions are preferred; feasible ties use tracking loss, while
+        infeasible ties use initial-state RMSE and then total loss.
 
         Parameters
         ----------
