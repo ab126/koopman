@@ -991,7 +991,7 @@ class LatentBehaviorMPCSolver:
         lambda_alpha: float = 0.0,
         alpha_mean: Optional[TensorLike] = None,
         alpha_std: Optional[TensorLike] = None,
-        A: Optional[TensorLike] = None,
+        A: Optional[TensorLike] = None, # TODO: remove in general case
         B: Optional[TensorLike] = None,
         lambda_dynamics: float = 0.0,
         w_mean: Optional[TensorLike] = None,
@@ -1467,7 +1467,7 @@ class LatentBehaviorMPCSolver:
             if candidate.x0_rmse <= self.constraint_tol:
                 break
             if candidate.x0_rmse > 0.75 * previous_rmse:
-                rho = min(rho * self.rho_x0_growth, self.rho_x0_max)
+                rho = min(rho * self.rho_x0_growth, self.rho_x0_max) # TODO: heuristic update; might need more principled approach
             previous_rmse = candidate.x0_rmse
         if self.use_lbfgs_polish and best is not None and best.finite:
             alpha = nn.Parameter(best.alpha.clone())
